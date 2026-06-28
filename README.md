@@ -69,7 +69,13 @@
 
 ### 2. 执行安装脚本
 
-进入 `Rely` 文件夹，执行 `install.sh`：
+一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MustangYM/SovietExtension/main/soviet.sh | bash -s install
+```
+
+或克隆仓库后，进入 `Rely` 文件夹执行 `install.sh`：
 
 ```bash
 cd SovietExtension/Rely
@@ -184,7 +190,7 @@ defaults read /Applications/WeChat.app/Contents/Info.plist CFBundleVersion
 
 ### 4. 安装后微信打不开
 
-可以先执行卸载脚本恢复：
+可先执行卸载脚本恢复：
 
 ```bash
 sh /Users/mustangym/SovietExtension/SovietExtension/Rely/uninstall.sh
@@ -196,7 +202,13 @@ sh /Users/mustangym/SovietExtension/SovietExtension/Rely/uninstall.sh
 
 ## Uninstall / 卸载
 
-进入 `Rely` 文件夹，执行：
+一键卸载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MustangYM/SovietExtension/main/soviet.sh | bash -s uninstall
+```
+
+或进入 `Rely` 文件夹，执行：
 
 ```bash
 sh uninstall.sh

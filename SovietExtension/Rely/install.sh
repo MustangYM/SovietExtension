@@ -16,6 +16,7 @@ APP_NAME="WeChat"
 FRAMEWORK_NAME="${FRAMEWORK_NAME:-SovietExtension}"
 APP_PATH="/Applications/${APP_NAME}.app"
 FORCE=0
+NON_INTERACTIVE=0
 RUN_SUDO=0
 
 # Runtime vars
@@ -62,6 +63,7 @@ Usage:
 
 Options:
   --force              Ignore version check and install anyway / 忽略版本检查，强制安装
+  --non-interactive    Exit on version mismatch instead of prompting / 版本不匹配时直接退出，不交互确认
   --app=PATH           Specify WeChat.app path / 指定 WeChat.app 路径
   --framework=NAME     Specify framework name, default: SovietExtension / 指定插件名，默认 SovietExtension
   --insert-dylib=PATH  Specify insert_dylib path / 指定 insert_dylib 路径
@@ -88,6 +90,9 @@ for arg in "$@"; do
     case "$arg" in
         --force)
             FORCE=1
+            ;;
+        --non-interactive)
+            NON_INTERACTIVE=1
             ;;
         --app=*)
             APP_PATH="${arg#--app=}"
@@ -468,6 +473,10 @@ check_supported_version() {
     if [ "${FORCE}" -eq 1 ]; then
         warn "Force mode enabled, continue anyway / 已使用 --force，继续安装"
         return 0
+    fi
+
+    if [ "${NON_INTERACTIVE}" -eq 1 ]; then
+        die "WeChat version not supported / 当前微信版本不在支持列表中，安装已中止"
     fi
 
     read -r -p "Continue anyway? 是否仍然继续安装？[y/N] " answer
