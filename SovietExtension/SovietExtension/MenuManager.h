@@ -19,7 +19,7 @@ static NSString *kExitChatroomNick = @"kExitChatroomNick.SOVIET";
 static NSString *kUseSystemWeb = @"kUseSystemWeb.SOVIET";
 static NSString *kIsFirstLoad = @"kIsFirstLoad.SOVIET";
 static NSString *kAutoLogin = @"kAutoLogin.SOVIET";
-static NSString *kCurrentVersion = @"1.2.0";
+static NSString *kCurrentVersion = @"1.3.0";
 
 @interface MenuManager : NSObject
 @property (nonatomic, assign) BOOL hasLoadMistyHook;
