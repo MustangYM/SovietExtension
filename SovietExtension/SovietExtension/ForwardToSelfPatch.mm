@@ -6,16 +6,16 @@
 //  撤回消息 → 同步发送给自己（全设备同步）
 //  ============================================================
 //
-//  ★ 核心思路：在微信撤回回调里拿到原始消息内容，通过 SendMsg CGI
-//    （sub_8da920）构造 type=5 文本消息发给自己的账号，全设备同步。
+//  ★ 核心思路：撤回回调提供原消息和显式本人账号。文字通知沿用 SendMsg CGI；
+//    图片、视频和文件消息保留完整原生数据，在主线程调用微信的单条转发入口。
+//    本人账号不安全时全部跳过；媒体适配不可用时仍发送文字通知。
 //
-//  ★ 依赖（共 1 个 VM 地址）：
-//     sub_8da920 (VA 0x8da920) — SendMsg CGI dispatcher
+//  ★ 文字入口：SendMsg CGI（268853: 0x8da920；269079: 0x8e8e64）
 //     - Hopper: strings → "sendmsg_Send" / "send_msg_to_user is empty" 交叉引用定位
 //     - x0 = 请求对象（80*8=640 字节），x1 = 1（发送标志）
 //     - profile.sendMsgCGIVA 管理，YMSendMsgCGIRuntimeAddress() 取
 //
-//  ★ 请求对象布局（堆上构造，4 轮试错确认）：
+//  ★ 文字请求对象布局（栈上构造，调用结束后析构字符串）：
 //     +0x000: uint32_t type = 5
 //     +0x120: std::string to       （接收方 wxid）
 //     +0x138: std::string content  （消息正文）
@@ -26,11 +26,11 @@
 //     开源用户反馈：部分环境下提醒消息没有发给自己，反而发给当前聊天对象。
 //     根因就是 outWrap/origin message 的字段在不同场景下可能是当前会话、发送者或群 ID，
 //     不能作为“当前登录账号”来源。
-//     现在改为由 RevokePatch.mm 在“撤回消息 rawWrap”里读取 rawWrap+48，
+//     现在由 RevokePatch.mm 按 profile.layout.selfUserOffset 读取撤回消息 rawWrap（当前为 +48），
 //     作为 explicit selfUserText 显式传入；本文件只做安全校验，不再猜 selfId。
 //     如果 selfUserText 不安全，直接跳过发送，宁可不发也不能误发给别人。
 //
-//  ★ MessageWrap 字段布局（616 字节，2026-06-26 日志确认）：
+//  ★ 历史 MessageWrap 字段记录（不能作为跨版本 ABI）：
 //     +0x18 (24)  = 会话展示名（私聊=对方号，群聊=群ID?）
 //     +0x30 (48)  = 在撤回消息 rawWrap 中可作为当前登录账号 / 自己
 //     +0x48 (72)  = 发送者 wxid
@@ -40,13 +40,18 @@
 //     +0x130(304) = 消息内容 (文本=原文, 图片=CDN XML)
 //     +0x148(328) = content/XML（另一偏移，可能冗余）
 //     +0x160(352) = msgSource XML
-//     +0x268(616) = 有效标志 (0=已删除)
+//     +0x268(616) = 查询结果 hasValue 标志（位于 616 字节消息数据之后，0 表示无值）
+//
+//  ★ 269079 媒体链：0x484f234 将 Wrap 转为 0x340 字节 MessageData，
+//    0x13b1bb0 添加唯一的本人目标，0x1453e34 构造消息请求并订阅异步任务。
+//    正常转图采样栈：0x533784 → 0x1453e34 → 0x1454414 → 0x3638f00。
+//    仅调用最后的任务构造器不会执行发送；完整入口负责构造、订阅和队列派发。
+//    profile 保存转换 0x484f234、析构 0x2e1ff8、转发 0x1453e34、目标插入 0x13b1bb0，
+//    四个入口均校验 UUID 和指纹；调用栈中的其他地址仅用于定位，不由插件直接调用。
+//    类型 49 是应用消息大类（包含文件），不能据此将所有类型 49 都认作文件。
 //
 //  ★ 群名获取（0 新增 hook/VM 地址，复用已有基础设施）：
 //     YMCachedRoomName(roomID) 查缓存，未命中回退为“未知群聊”。
-//
-//  ★ 图片/视频/文件 转发（TODO，当前仅发文本通知）：
-//     当前只发送提醒，不实际转发媒体内容。
 //
 //  ★ 门控：NSUserDefaults("kRevokeForwardToSelfRealSend.SOVIET")
 //         或 /tmp/YMRevokeForwardToSelfRealSend 文件哨兵
@@ -60,6 +65,12 @@
 #include <string>
 #include <stdarg.h>
 #include <new>
+#include <cstring>
+#include <memory>
+#include <map>
+#include <set>
+#include <vector>
+#include <cstddef>
 
 #pragma mark - 门控
 
@@ -282,7 +293,7 @@ static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
     return notice;
 }
 
-#pragma mark - sub_8da920 type=5 发送
+#pragma mark - SendMsg CGI type=5 发送（268853: 0x8da920；269079: 0x8e8e64）
 
 static BOOL YMForwardViaSendMsgCGI(NSString *selfId, NSString *content) {
     if (!selfId.length || !content.length) {
@@ -325,6 +336,116 @@ static BOOL YMForwardViaSendMsgCGI(NSString *selfId, NSString *content) {
 
 #pragma mark - 统一入口
 
+struct YMForwardMessageData {
+    uintptr_t words[0x340 / sizeof(uintptr_t)];
+};
+
+struct YMForwardTargets {
+    // 269079 原生上下文布局；key=2 是普通微信目标，另外两项保持为空。
+    std::map<int32_t, std::set<std::string>> accounts;
+    std::vector<std::shared_ptr<void>> additionalItems;
+    std::string wxworkRecipient;
+};
+
+struct YMForwardSubscription {
+    // 原生返回值通过 arm64 x8 写入；队列持有自己的副本，可像原调用方一样释放局部句柄。
+    uint64_t identifier;
+    std::shared_ptr<void> cancellation;
+    std::shared_ptr<void> owner;
+};
+
+static_assert(sizeof(YMForwardTargets) == 0x48);
+static_assert(offsetof(YMForwardTargets, additionalItems) == 0x18);
+static_assert(offsetof(YMForwardTargets, wxworkRecipient) == 0x30);
+static_assert(sizeof(YMForwardSubscription) == 0x28);
+static_assert(offsetof(YMForwardSubscription, cancellation) == 0x8);
+static_assert(offsetof(YMForwardSubscription, owner) == 0x18);
+
+static BOOL YMSubmitMediaToSelf(const std::shared_ptr<YMForwardMessageData> &message,
+                                NSString *selfId, YMMediaForwardAddresses addresses) {
+    try {
+        YMForwardTargets targets;
+        std::string recipient([selfId UTF8String]);
+        ((void (*)(YMForwardTargets *, int32_t, const std::string *))addresses.addRecipient)(&targets, 2, &recipient);
+        // 原生插入后再次验证完整目标集合；不符合唯一本人约束时停止提交。
+        if (targets.accounts.size() != 1 || targets.accounts.at(2) != std::set<std::string>{recipient} ||
+            !targets.additionalItems.empty() || !targets.wxworkRecipient.empty()) {
+            YMForwardLog(@"native recipient validation failed; skip media");
+            return NO;
+        }
+        // 可选来源的 +0x78 有效位为零；回调组的三个函数槽为空，不绑定 UI 对象。
+        uintptr_t source[16] = {};
+        uintptr_t callbacks[17] = {};
+        typedef YMForwardSubscription (*ForwardMessage)(YMForwardTargets *, const YMForwardMessageData *,
+                                                        const void *, const void *);
+        YMForwardSubscription subscription = ((ForwardMessage)addresses.forward)(&targets, message.get(), source, callbacks);
+        // 有效句柄只证明已订阅任务，不代表服务器已接收或媒体已送达。
+        if (!subscription.identifier || !subscription.cancellation) {
+            YMForwardLog(@"native forwarding did not create a subscription");
+            return NO;
+        }
+        YMForwardLog(@"native media task subscribed for self; delivery pending");
+        return YES;
+    } catch (...) {
+        YMForwardLog(@"native media forwarding failed; use text notice");
+        return NO;
+    }
+}
+
+static BOOL YMForwardMediaToSelf(uintptr_t outWrap, uint32_t originType, NSString *selfId) {
+    if (!outWrap || (originType != 3 && originType != 43 && originType != 49)) return NO;
+    YMMediaForwardAddresses addresses = {};
+    if (!YMGetMediaForwardAddresses(&addresses) || !addresses.fromWrap || !addresses.destruct ||
+        !addresses.forward || !addresses.addRecipient) {
+        YMForwardLog(@"media forwarding unavailable for this binary; use text notice");
+        return NO;
+    }
+    uint32_t wrapType = 0;
+    uint64_t sourceID = 0;
+    // 269079 转换关系：Wrap+0xc → Data+8，Wrap+0xf8 → Data+0x90。
+    memcpy(&wrapType, (const void *)(outWrap + 12), sizeof(wrapType));
+    memcpy(&sourceID, (const void *)(outWrap + 0xf8), sizeof(sourceID));
+    if (wrapType != originType || sourceID == 0) {
+        YMForwardLog(@"media source layout mismatch or missing ID; use text notice");
+        return NO;
+    }
+
+    typedef YMForwardMessageData (*ConvertMessage)(uintptr_t);
+    typedef void (*DestroyMessage)(YMForwardMessageData *);
+    BOOL submitted = NO;
+    try {
+        // 依赖 C++17 直接初始化返回值，避免复制含内部自引用的原生对象。
+        // shared_ptr 保证跨主线程排队仍存活；释放时先执行原生析构，再释放存储。
+        std::shared_ptr<YMForwardMessageData> message(
+            new YMForwardMessageData(((ConvertMessage)addresses.fromWrap)(outWrap)),
+            [addresses](YMForwardMessageData *value) {
+                ((DestroyMessage)addresses.destruct)(value);
+                delete value;
+            });
+        uint32_t convertedType = 0;
+        uint64_t convertedID = 0;
+        memcpy(&convertedType, (const uint8_t *)message.get() + 8, sizeof(convertedType));
+        memcpy(&convertedID, (const uint8_t *)message.get() + 0x90, sizeof(convertedID));
+        if (convertedType == originType && convertedID == sourceID) {
+            if ([NSThread isMainThread]) {
+                submitted = YMSubmitMediaToSelf(message, selfId, addresses);
+            } else {
+                // 原撤回回调可能不在主线程；先转换并持有数据，不跨线程保留 outWrap 裸指针。
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    YMSubmitMediaToSelf(message, selfId, addresses);
+                });
+                submitted = YES;
+            }
+            if (submitted) YMForwardLog(@"media forwarding queued for self. type=%u; delivery pending", originType);
+        } else {
+            YMForwardLog(@"converted media identity mismatch; use text notice");
+        }
+    } catch (...) {
+        YMForwardLog(@"native media forwarding failed; use text notice");
+    }
+    return submitted;
+}
+
 BOOL YMForwardToSelfSend(uintptr_t outWrap,
                          uint32_t originType,
                          NSString *originContent,
@@ -332,8 +453,6 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
                          NSString *selfUserText,
                          NSString *revokerWxid,
                          NSString *revokerDisplayName) {
-    (void)outWrap;
-
     NSString *selfId = YMForwardTrim(selfUserText);
 
     if (!YMForwardLooksLikeSafeSelfID(selfId, sessionText, revokerWxid, revokerDisplayName)) {
@@ -346,11 +465,16 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
         return NO;
     }
 
+    BOOL mediaSubmitted = YMForwardMediaToSelf(outWrap, originType, selfId);
     NSString *notice = YMBuildRevokeForwardNotice(sessionText ?: @"",
                                                   originType,
                                                   originContent ?: @"",
                                                   revokerWxid ?: @"",
                                                   revokerDisplayName ?: @"");
+    if (mediaSubmitted) {
+        notice = [notice stringByReplacingOccurrencesOfString:@"\n(非文字消息只做提醒)"
+                                                  withString:@"\n(原消息已加入转发队列，结果以实际收到为准)"];
+    }
 
     if (notice.length == 0) {
         YMForwardLog(@"notice is empty, skip real send. selfId=%@ session=%@", selfId ?: @"", sessionText ?: @"");
@@ -363,5 +487,7 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
                  originType,
                  (unsigned long)notice.length);
 
-    return YMForwardViaSendMsgCGI(selfId, notice);
+    BOOL noticeSent = YMForwardViaSendMsgCGI(selfId, notice);
+    // 返回值表示通知调用成功或媒体已排队；异步失败记录日志，不撤销已发出的文字通知。
+    return mediaSubmitted || noticeSent;
 }

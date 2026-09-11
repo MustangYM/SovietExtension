@@ -1,1 +1,6 @@
 Test/
+/work/
+/frida/
+/tests/
+__pycache__/
+*.pyc
