@@ -166,7 +166,8 @@ typedef struct {
     uintptr_t revokeDeleteMessagesVA;
 
     uintptr_t openURLWebViewKindVA;
-    uintptr_t sendMsgCGIVA;         // sub_8da920: SendMsg CGI dispatcher（撤回转发给我）
+    uintptr_t sendMsgCGIVA;         // SendMsg CGI（268853: 0x8da920；269079: 0x8e8e64）
+    YMMediaForwardAddresses mediaForward;
 
     YMMessageWrapLayout layout;
     
@@ -382,7 +383,9 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .openURLWebViewKindVA = 0x1CAE1E0, //->Lhook->GetUrlWebViewKind
         
         //String里"SendMsg",pesudo中有简短的" is empty"
-        .sendMsgCGIVA = 0x8E8E64,   // sub_8da920: SendMsg CGI dispatcher
+        .sendMsgCGIVA = 0x8E8E64,   // sub_8e8e64: SendMsg CGI dispatcher（269079）
+        // 顺序：MessageWrap 转换、MessageData 析构、单条转发并订阅、插入目标账号。
+        .mediaForward = {0x484f234, 0x2e1ff8, 0x1453e34, 0x13b1bb0},
 
         .layout = {
             .messageWrapSize = 616,
@@ -887,6 +890,61 @@ uintptr_t YMSendMsgCGIRuntimeAddress(void) {
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
     if (!profile || profile->sendMsgCGIVA == 0) return 0;
     return YMRuntimeAddress(profile->sendMsgCGIVA);
+}
+
+BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
+    if (!addresses) return NO;
+    *addresses = {};
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || !profile->mediaForward.fromWrap || !YMWeChatDylibSlide) return NO;
+
+    // 私有 ABI 只适用于已分析的 arm64 样本；版本号相同也可能有不同二进制。
+    struct mach_header_64 header = {};
+    if (!YMSafeReadMemory(YMWeChatDylibSlide, &header, sizeof(header)) ||
+        header.magic != MH_MAGIC_64 || header.cputype != CPU_TYPE_ARM64 ||
+        header.sizeofcmds > 1024 * 1024) return NO;
+    static const uint8_t expectedUUID[16] = {
+        0x58, 0x02, 0x94, 0xa4, 0x5a, 0xf5, 0x31, 0x0d,
+        0x9a, 0x9a, 0xc3, 0x63, 0x9b, 0xee, 0x0a, 0x28
+    };
+    BOOL matchesUUID = NO;
+    size_t offset = sizeof(header);
+    size_t end = offset + header.sizeofcmds;
+    for (uint32_t index = 0; index < header.ncmds && offset + sizeof(struct load_command) <= end; index++) {
+        struct load_command command = {};
+        if (!YMSafeReadMemory(YMWeChatDylibSlide + offset, &command, sizeof(command)) ||
+            command.cmdsize < sizeof(command) || command.cmdsize > end - offset) return NO;
+        if (command.cmd == LC_UUID) {
+            struct uuid_command uuid = {};
+            if (command.cmdsize < sizeof(uuid) ||
+                !YMSafeReadMemory(YMWeChatDylibSlide + offset, &uuid, sizeof(uuid))) return NO;
+            matchesUUID = memcmp(uuid.uuid, expectedUUID, sizeof(expectedUUID)) == 0;
+            break;
+        }
+        offset += command.cmdsize;
+    }
+    if (!matchesUUID) return NO;
+
+    // 顺序对应转换、析构、单条转发、目标插入；入口被其他 Hook 改写时也拒绝调用。
+    static const uint8_t entryBytes[4][16] = {
+        {0xff, 0xc3, 0x01, 0xd1, 0xf8, 0x5f, 0x03, 0xa9, 0xf6, 0x57, 0x04, 0xa9, 0xf4, 0x4f, 0x05, 0xa9},
+        {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00, 0xaa},
+        {0xff, 0x43, 0x06, 0xd1, 0xfc, 0x6f, 0x13, 0xa9, 0xfa, 0x67, 0x14, 0xa9, 0xf8, 0x5f, 0x15, 0xa9},
+        {0xff, 0x83, 0x01, 0xd1, 0xf8, 0x5f, 0x02, 0xa9, 0xf6, 0x57, 0x03, 0xa9, 0xf4, 0x4f, 0x04, 0xa9}
+    };
+    uintptr_t runtime[4] = {
+        YMRuntimeAddress(profile->mediaForward.fromWrap),
+        YMRuntimeAddress(profile->mediaForward.destruct),
+        YMRuntimeAddress(profile->mediaForward.forward),
+        YMRuntimeAddress(profile->mediaForward.addRecipient)
+    };
+    for (size_t index = 0; index < 4; index++) {
+        uint8_t current[16] = {};
+        if (!runtime[index] || !YMSafeReadMemory(runtime[index], current, sizeof(current)) ||
+            memcmp(current, entryBytes[index], sizeof(current)) != 0) return NO;
+    }
+    *addresses = {runtime[0], runtime[1], runtime[2], runtime[3]};
+    return YES;
 }
 
 static inline void *YMRuntimePointer(uintptr_t staticVA) {
