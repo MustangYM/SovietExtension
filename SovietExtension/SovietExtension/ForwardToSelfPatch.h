@@ -12,10 +12,10 @@
 //      0x484f234：MessageWrap → MessageData；0x2e1ff8：MessageData 析构。
 //      0x1453e34：单条消息转发并订阅任务；0x13b1bb0：插入本人接收方。
 //    以上 VA 均为 wechat.dylib arm64 静态地址，运行时需加模块基址。
-//    RevokePatch 中 UpdateSessionCache hook 提供的群名缓存（YMCachedRoomName）
+//    RevokePatch 中按需查询微信会话资料的 YMQueryRoomName（269079: 0x3830E14）
 //
 //  思路：撤回回调里拿到原始消息内容，构造 type=5 文本消息通过 SendMsg CGI
-//  发给自己；媒体同时通过原生单条转发链排队。群名从缓存取，未命中回退为“未知群聊”。
+//  发给自己；媒体同时通过原生单条转发链排队。群名按需查询，未命中回退为群 ID。
 //
 
 #import <Foundation/Foundation.h>
@@ -35,7 +35,7 @@ typedef struct {
 BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses);
 
 /// 通过 roomID 查群名，查不到返回 @""
-NSString *YMCachedRoomName(NSString *roomID);
+NSString *YMQueryRoomName(NSString *roomID);
 
 BOOL YMRevokeRealSendForwardEnabled(void);
 

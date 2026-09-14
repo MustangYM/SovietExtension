@@ -50,8 +50,8 @@
 //    四个入口均校验 UUID 和指纹；调用栈中的其他地址仅用于定位，不由插件直接调用。
 //    类型 49 是应用消息大类（包含文件），不能据此将所有类型 49 都认作文件。
 //
-//  ★ 群名获取（0 新增 hook/VM 地址，复用已有基础设施）：
-//     YMCachedRoomName(roomID) 查缓存，未命中回退为“未知群聊”。
+//  ★ 群名获取：269079 的 0x3830E14 按会话 ID 同步查询微信会话资料。
+//     YMQueryRoomName(roomID) 校验会话 ID 后返回群名；未命中/未适配时显示群 ID。
 //
 //  ★ 门控：NSUserDefaults("kRevokeForwardToSelfRealSend.SOVIET")
 //         或 /tmp/YMRevokeForwardToSelfRealSend 文件哨兵
@@ -272,8 +272,8 @@ static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
     [notice appendString:@"--拦截到一条撤回消息--\n"];
 
     if ([sessionText containsString:@"@chatroom"]) {
-        NSString *roomName = YMCachedRoomName(sessionText);
-        [notice appendFormat:@"群名:%@\n", roomName.length > 0 ? roomName : @"未知群聊"];
+        NSString *roomName = YMQueryRoomName(sessionText);
+        [notice appendFormat:@"群名:%@\n", roomName.length > 0 ? roomName : sessionText];
     }
 
     [notice appendFormat:@"撤回人:%@\n", revokerDisplay.length > 0 ? revokerDisplay : @"***"];

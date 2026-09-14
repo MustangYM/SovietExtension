@@ -29,6 +29,8 @@
 #include <set>
 #include <time.h>
 #include <atomic>
+#include <memory>
+#include <cstddef>
 
 #pragma mark - 全局状态
 
@@ -44,8 +46,6 @@ static BOOL YMHasRegisteredDyldCallback = NO;
 
 // 群员退群监控 Patch 状态
 static BOOL YMHasPatchedGroupExitMonitor = NO;
-// 群名缓存由防撤回转发和退群昵称共享，独立安装、独立重试。
-static BOOL YMHasPatchedRoomNameCache = NO;
 
 static BOOL YMHasPatchedOpenURLWithSystemBrowser = NO;
 
@@ -169,6 +169,7 @@ typedef struct {
 
     uintptr_t openURLWebViewKindVA;
     uintptr_t sendMsgCGIVA;         // SendMsg CGI（268853: 0x8da920；269079: 0x8e8e64）
+    uintptr_t roomNameQueryVA;
     YMMediaForwardAddresses mediaForward;
 
     YMMessageWrapLayout layout;
@@ -231,6 +232,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
         .openURLWebViewKindVA = 0,
         .sendMsgCGIVA = 0,  // 4.1.9 未适配
+        .roomNameQueryVA = 0,
 
         .layout = {
             .messageWrapSize = 616,
@@ -314,6 +316,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         
         //String里"SendMsg",pesudo中有简短的" is empty"
         .sendMsgCGIVA = 0x8da920,   // sub_8da920: SendMsg CGI dispatcher
+        .roomNameQueryVA = 0,
 
         .layout = {
             .messageWrapSize = 616,
@@ -386,6 +389,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         
         //String里"SendMsg",pesudo中有简短的" is empty"
         .sendMsgCGIVA = 0x8E8E64,   // sub_8e8e64: SendMsg CGI dispatcher（269079）
+        .roomNameQueryVA = 0x3830E14,
         // 顺序：MessageWrap 转换、MessageData 析构、单条转发并订阅、插入目标账号。
         .mediaForward = {0x484f234, 0x2e1ff8, 0x1453e34, 0x13b1bb0},
 
@@ -434,6 +438,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
 
          .sendMsgCGIVA = 新版 SendMsg CGI dispatcher 地址 (sub_8da920)，没有就填 0,
+         .roomNameQueryVA = 已验证会话查询 ABI 的入口地址，没有就填 0，并更新 UUID 和入口指纹,
 
          .layout = {
              .messageWrapSize = 616,
@@ -559,11 +564,6 @@ static BOOL YMIsGroupExitMonitorEnabled(void) {
 
 static BOOL YMIsGroupExitNicknameEnabled(void) {
     return YMFeatureGroupExitMonitorEnabled && YMFeatureGroupExitNicknameEnabled;
-}
-
-static BOOL YMShouldEnableRoomNameCache(void) {
-    return YMIsGroupExitNicknameEnabled() ||
-           (YMFeatureAntiRevokeEnabled && YMRevokeRealSendForwardEnabled());
 }
 
 static BOOL YMIsAntiRevokeEnabled(void) {
@@ -894,12 +894,7 @@ uintptr_t YMSendMsgCGIRuntimeAddress(void) {
     return YMRuntimeAddress(profile->sendMsgCGIVA);
 }
 
-BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
-    if (!addresses) return NO;
-    *addresses = {};
-    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-    if (!profile || !profile->mediaForward.fromWrap || !YMWeChatDylibSlide) return NO;
-
+static BOOL YMMatchesWeChat269079Dylib(void) {
     // 私有 ABI 只适用于已分析的 arm64 样本；版本号相同也可能有不同二进制。
     struct mach_header_64 header = {};
     if (!YMSafeReadMemory(YMWeChatDylibSlide, &header, sizeof(header)) ||
@@ -925,7 +920,15 @@ BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
         }
         offset += command.cmdsize;
     }
-    if (!matchesUUID) return NO;
+    return matchesUUID;
+}
+
+BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
+    if (!addresses) return NO;
+    *addresses = {};
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || !profile->mediaForward.fromWrap || !YMWeChatDylibSlide ||
+        !YMMatchesWeChat269079Dylib()) return NO;
 
     // 顺序对应转换、析构、单条转发、目标插入；入口被其他 Hook 改写时也拒绝调用。
     static const uint8_t entryBytes[4][16] = {
@@ -1824,39 +1827,98 @@ static NSMutableDictionary<NSString *, NSString *> *YMGroupExitDisplayNameCache(
     return cache;
 }
 
-// 群聊 roomID → 群名 缓存，由独立安装的 UpdateSessionCache hook 喂入。
-// 防撤回转发启用时无需开启退群监控或退群昵称。
-// a2 来自 session_service::UpdateSessionCache 的第二个参数：
-//   a2+0x000 = roomID   (std::string, "19228060266@chatroom")
-//   a2+0x120 = 群名     (std::string, "小马甲")
-// 偏移经 2026-06-26 日志确认。新版 wechat.dylib 适配时若失效，
-// 在 hook 里用 YMNSStringFromLibcppStringObject 扫 a2[0..0x400] 重定位即可。
-static NSMutableDictionary<NSString *, NSString *> *YMRoomNameCache(void) {
-    static NSMutableDictionary<NSString *, NSString *> *cache = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cache = [[NSMutableDictionary alloc] init];
-    });
-    return cache;
+#pragma mark - 按需查询群名
+
+/*
+ Build 269079 / arm64：0x3830E14 按 x1=std::string* 查询，x2=已构造的会话对象。
+ x0 在入口即被覆盖，当前 UUID 下不读取传入的 this；不能沿用到未核实的版本。
+ 0x3A148C0 在共享锁内查微信自身的会话表，命中经 0x313828 / 0x31A7CC 赋值。
+ +0x000 为会话 ID，+0x120 为群名；读取群名前校验返回的会话 ID 与查询一致。
+ 输出布局由赋值函数和析构 0x154094 / 0x154218 交叉核对，总长 0x218。
+ 0x31A8B4 复制 +0x190 的 vector，元素为 24 字节 string + 8 字节值。
+ +0xC0 的 shared_ptr 仅被赋值；0x31A854 明确允许旧控制块为空，不需伪造控制块。
+ 用 libc++ 对象正常构造/析构承接所有权，不能把清零的字节数组当赋值目标。
+ 查询在撤回回调内同步完成，群名复制为 NSString 后释放临时会话对象。
+ */
+struct YMRoomSessionEntry {
+    std::string text;
+    uint64_t value = 0;
+};
+
+struct YMRoomSessionData {
+    std::string roomID;
+    uint8_t field18[0x28] = {};
+    std::string field40;
+    std::string field58;
+    uint8_t field70[0x20] = {};
+    std::string field90;
+    std::string fieldA8;
+    std::shared_ptr<void> fieldC0;
+    uint8_t fieldD0[8] = {};
+    std::string fieldD8;
+    std::string fieldF0;
+    std::string field108;
+    std::string roomName;
+    uint8_t field138[0x18] = {};
+    std::string field150;
+    std::string field168;
+    uint8_t field180[0x10] = {};
+    std::vector<YMRoomSessionEntry> field190;
+    uint8_t field1A8[8] = {};
+    std::string field1B0;
+    std::string field1C8;
+    std::string field1E0;
+    uint8_t field1F8[8] = {};
+    std::string field200;
+};
+
+static_assert(sizeof(std::string) == 0x18 && sizeof(YMRoomSessionEntry) == 0x20, "WeChat string/vector ABI");
+static_assert(sizeof(YMRoomSessionData) == 0x218 && alignof(YMRoomSessionData) == 8, "WeChat session ABI");
+static_assert(offsetof(YMRoomSessionData, field40) == 0x40 && offsetof(YMRoomSessionData, field58) == 0x58, "session strings");
+static_assert(offsetof(YMRoomSessionData, field90) == 0x90 && offsetof(YMRoomSessionData, fieldA8) == 0xa8, "session strings");
+static_assert(offsetof(YMRoomSessionData, fieldC0) == 0xc0 && offsetof(YMRoomSessionData, fieldD8) == 0xd8, "session shared_ptr");
+static_assert(offsetof(YMRoomSessionData, fieldF0) == 0xf0 && offsetof(YMRoomSessionData, field108) == 0x108, "session strings");
+static_assert(offsetof(YMRoomSessionData, roomName) == 0x120 && offsetof(YMRoomSessionData, field150) == 0x150, "session name");
+static_assert(offsetof(YMRoomSessionData, field168) == 0x168 && offsetof(YMRoomSessionData, field190) == 0x190, "session vector");
+static_assert(offsetof(YMRoomSessionData, field1B0) == 0x1b0 && offsetof(YMRoomSessionData, field1C8) == 0x1c8, "session strings");
+static_assert(offsetof(YMRoomSessionData, field1E0) == 0x1e0 && offsetof(YMRoomSessionData, field200) == 0x200, "session tail");
+
+static uintptr_t YMRoomNameQueryRuntimeAddress(void) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile || !profile->roomNameQueryVA || !YMWeChatDylibSlide ||
+        !YMMatchesWeChat269079Dylib()) return 0;
+
+    static const uint8_t expectedEntry[16] = {
+        0xf6, 0x57, 0xbd, 0xa9, 0xf4, 0x4f, 0x01, 0xa9,
+        0xfd, 0x7b, 0x02, 0xa9, 0xfd, 0x83, 0x00, 0x91
+    };
+    uintptr_t address = YMRuntimeAddress(profile->roomNameQueryVA);
+    uint8_t current[16] = {};
+    if (!YMSafeReadMemory(address, current, sizeof(current)) ||
+        memcmp(current, expectedEntry, sizeof(current)) != 0) return 0;
+    return address;
 }
 
-static void YMCacheRoomName(NSString *roomID, NSString *roomName) {
-    if (roomID.length == 0 || roomName.length == 0) return;
-    if (![roomID containsString:@"@chatroom"]) return;
-    if ([roomName containsString:@"@"] || roomName.length > 64) return;
-    NSMutableDictionary<NSString *, NSString *> *cache = YMRoomNameCache();
-    @synchronized (cache) {
-        if (![cache[roomID] isEqualToString:roomName]) {
-            cache[roomID] = roomName;
-        }
-    }
-}
+NSString *YMQueryRoomName(NSString *roomID) {
+    if (![roomID hasSuffix:@"@chatroom"] || roomID.length > 128 ||
+        [roomID rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location != NSNotFound) return @"";
+    uintptr_t address = YMRoomNameQueryRuntimeAddress();
+    if (!address) return @"";
 
-NSString *YMCachedRoomName(NSString *roomID) {
-    if (roomID.length == 0) return @"";
-    NSMutableDictionary<NSString *, NSString *> *cache = YMRoomNameCache();
-    @synchronized (cache) {
-        return cache[roomID] ?: @"";
+    try {
+        std::string query = YMStdStringFromNSString(roomID);
+        if (query.empty() || query.size() > 128) return @"";
+        YMRoomSessionData session;
+        using QuerySession = uint64_t (*)(uintptr_t, const std::string *, YMRoomSessionData *);
+        uint64_t status = ((QuerySession)address)(0, &query, &session);
+        if (status != 1 || session.roomID != query || session.roomName.empty() ||
+            session.roomName.size() > 1024) return @"";
+        return [[NSString alloc] initWithBytes:session.roomName.data()
+                                       length:session.roomName.size()
+                                     encoding:NSUTF8StringEncoding] ?: @"";
+    } catch (...) {
+        YMLog(@"[RoomNameQuery] session lookup failed");
+        return @"";
     }
 }
 
@@ -3275,18 +3337,11 @@ static void YMGroupExitUpdateSessionCacheHook(uint64_t a1, int64_t a2, int64_t a
     @autoreleasepool {
         YMGroupExitCallOriginalUpdateSessionCache(a1, a2, a3, a4);
 
-        // roomID→群名 缓存：a2+0x000=roomID, a2+0x120=群名（2026-06-26 日志确认）
-        if (a2) {
-            NSString *roomID = YMNSStringFromLibcppStringObject((const void *)((uintptr_t)a2 + 0x00));
-            NSString *roomName = YMNSStringFromLibcppStringObject((const void *)((uintptr_t)a2 + 0x120));
-            if ([roomID containsString:@"@chatroom"] && roomName.length > 0 && ![roomName containsString:@"@"]) {
-                YMCacheRoomName(roomID, roomName);
-            }
-        }
-
         if (YMIsGroupExitNicknameEnabled()) {
             YMGroupExitFlushPreloadRooms("session_service UpdateSessionCache");
             YMGroupExitFlushPendingNotices("session_service UpdateSessionCache");
+        } else if (!YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitClearRuntimeStateIfDisabled("session_service UpdateSessionCache");
         }
     }
 }
@@ -3338,58 +3393,6 @@ static BOOL YMPatchGroupExitSingleFunction(uintptr_t targetAddress,
     return ok;
 }
 
-// 复用已有 UpdateSessionCache 地址；不依赖退群检测的 DB/FMessagePre 地址。
-static BOOL YMPatchRoomNameCacheWithSlide(intptr_t slide, NSString *source) {
-    if (!YMShouldEnableRoomNameCache()) {
-        return NO;
-    }
-    if (YMHasPatchedRoomNameCache) {
-        return YES;
-    }
-
-    YMRecordWeChatDylibSlide(slide, source ?: @"room name cache patch");
-    if (!YMIsTargetWeChatVersion()) {
-        return NO;
-    }
-
-    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-    if (!profile || profile->groupExitUpdateSessionCacheVA == 0) {
-        YMLog(@"[RoomNameCache] current profile has no UpdateSessionCache address, skip. source=%@", source);
-        return NO;
-    }
-
-    YMHasPatchedRoomNameCache = YMPatchGroupExitSingleFunction(
-        YMRuntimeAddress(profile->groupExitUpdateSessionCacheVA),
-        (uintptr_t)&YMGroupExitUpdateSessionCacheHook,
-        YMGroupExitOriginalUpdateSessionCacheBytes,
-        YMGroupExitHookUpdateSessionCacheBytes,
-        &YMGroupExitHasSavedOriginalUpdateSessionCacheBytes,
-        &YMGroupExitUpdateSessionCacheRuntimeAddress,
-        "shared session_service::UpdateSessionCache",
-        source);
-    YMLog(@"[RoomNameCache] patch result=%@ groupExit=%@ revokeForward=%@ source=%@",
-          YMHasPatchedRoomNameCache ? @"OK" : @"FAIL",
-          YMIsGroupExitMonitorEnabled() ? @"ON" : @"OFF",
-          YMRevokeRealSendForwardEnabled() ? @"ON" : @"OFF",
-          source);
-    return YMHasPatchedRoomNameCache;
-}
-
-static void YMInstallRoomNameCachePatch(void) {
-    if (!YMShouldEnableRoomNameCache() || YMHasPatchedRoomNameCache) {
-        return;
-    }
-
-    YMRegisterDyldCallbackIfNeeded();
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && YMIsTargetWeChatResourceDylibPath([NSString stringWithUTF8String:name])) {
-            YMPatchRoomNameCacheWithSlide(_dyld_get_image_vmaddr_slide(i), @"room name cache dyld image scan");
-            return;
-        }
-    }
-}
-
 static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
     if (YMHasPatchedGroupExitMonitor) {
         YMLog(@"[GroupExitMonitor] already patched, skip. source=%@", source);
@@ -3414,13 +3417,16 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
     uintptr_t dbApplyTarget = YMRuntimeAddress(profile->groupExitDBApplyVA);
     uintptr_t fmessagePreTarget = YMRuntimeAddress(profile->groupExitFMessagePreVA);
     BOOL nicknameEnabled = YMIsGroupExitNicknameEnabled();
+    BOOL updateSessionCacheHookEnabled = nicknameEnabled;
     BOOL nicknamePreloadHookEnabled = nicknameEnabled;
 
+    uintptr_t updateSessionCacheTarget = updateSessionCacheHookEnabled ? YMRuntimeAddress(profile->groupExitUpdateSessionCacheVA) : 0;
     uintptr_t memberDataListTarget = nicknamePreloadHookEnabled ? YMRuntimeAddress(profile->groupExitMemberDataListVA) : 0;
     uintptr_t chatroomInfoOperatorTarget = nicknamePreloadHookEnabled ? YMRuntimeAddress(profile->groupExitChatroomInfoOperatorVA) : 0;
 
     uintptr_t dbApplyHook = (uintptr_t)&YMGroupExitDBApplyHook;
     uintptr_t fmessagePreHook = (uintptr_t)&YMGroupExitFMessagePreHook;
+    uintptr_t updateSessionCacheHook = (uintptr_t)&YMGroupExitUpdateSessionCacheHook;
     uintptr_t memberDataListHook = (uintptr_t)&YMGroupExitMemberDataListHook;
     uintptr_t chatroomInfoOperatorHook = (uintptr_t)&YMGroupExitChatroomInfoOperatorHook;
 
@@ -3441,6 +3447,22 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
                                                        &YMGroupExitFMessagePreRuntimeAddress,
                                                        "group exit fmessage_manager::InsertFMessageToSessionPre",
                                                        source);
+
+    BOOL okUpdateSessionCache = YES;
+    if (updateSessionCacheHookEnabled && updateSessionCacheTarget != 0) {
+        okUpdateSessionCache = YMPatchGroupExitSingleFunction(updateSessionCacheTarget,
+                                                             updateSessionCacheHook,
+                                                             YMGroupExitOriginalUpdateSessionCacheBytes,
+                                                             YMGroupExitHookUpdateSessionCacheBytes,
+                                                             &YMGroupExitHasSavedOriginalUpdateSessionCacheBytes,
+                                                             &YMGroupExitUpdateSessionCacheRuntimeAddress,
+                                                             "group exit session_service::UpdateSessionCache",
+                                                             source);
+    } else {
+        YMLog(@"[GroupExitMonitor] UpdateSessionCache nickname safe point skipped. nickname=%@ profile=%s",
+              nicknameEnabled ? @"ON" : @"OFF",
+              profile ? profile->displayName : "NULL");
+    }
 
     BOOL okMemberDataList = YES;
     if (nicknamePreloadHookEnabled && memberDataListTarget != 0) {
@@ -3474,9 +3496,9 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
               profile ? profile->displayName : "NULL");
     }
 
-    BOOL ok = okDBApply && okFMessagePre && okMemberDataList && okChatroomInfoOperator;
+    BOOL ok = okDBApply && okFMessagePre && okUpdateSessionCache && okMemberDataList && okChatroomInfoOperator;
 
-    YMLog(@"[GroupExitMonitor] patch result=%@ source=%@ profile=%s nickname=%@ slide=0x%lx DBApply=0x%lx FMessagePre=0x%lx MemberDataList=0x%lx ChatroomInfoOperator=0x%lx",
+    YMLog(@"[GroupExitMonitor] patch result=%@ source=%@ profile=%s nickname=%@ slide=0x%lx DBApply=0x%lx FMessagePre=0x%lx UpdateSessionCache=0x%lx MemberDataList=0x%lx ChatroomInfoOperator=0x%lx",
           ok ? @"OK" : @"FAIL",
           source ?: @"",
           profile->displayName,
@@ -3484,6 +3506,7 @@ static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
           (unsigned long)YMWeChatDylibSlide,
           (unsigned long)dbApplyTarget,
           (unsigned long)fmessagePreTarget,
+          (unsigned long)updateSessionCacheTarget,
           (unsigned long)memberDataListTarget,
           (unsigned long)chatroomInfoOperatorTarget);
 
@@ -3996,13 +4019,6 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
         if (!alreadySeen) {
             YMRevokeSeenSvrIds->insert(svrId);
             if (YMRevokeRealSendForwardEnabled()) {
-                // 群名缓存未命中时主动加载该群数据，触发 UpdateSessionCache 填充缓存
-                if ([sessionText containsString:@"@chatroom"] && YMCachedRoomName(sessionText).length == 0) {
-                    int64_t mgr = YMGroupExitKnownChatroomManager.load();
-                    if (mgr) {
-                        YMGroupExitPreloadMemberDataListForRoom(mgr, sessionText, "revoke forward fallback");
-                    }
-                }
                 NSString *forwardSelfUserText = @"";
                 const YMWeChatAdaptProfile *forwardProfile = YMGetActiveProfile();
                 size_t forwardSelfUserOffset = forwardProfile ? forwardProfile->layout.selfUserOffset : 48;
@@ -4924,9 +4940,6 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
         YMPatchOpenURLWithSystemBrowserWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 
-    if (YMShouldEnableRoomNameCache()) {
-        YMPatchRoomNameCacheWithSlide(vmaddr_slide, @"dyld add image callback");
-    }
 
     if (YMIsGroupExitMonitorEnabled()) {
         YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
@@ -4987,22 +5000,6 @@ static void YMInstallAntiRevokeIfNeeded(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         YMInstallAntiRevokePatch();
-    });
-}
-
-static void YMInstallRoomNameCacheIfNeeded(void) {
-    if (!YMShouldEnableRoomNameCache()) {
-        return;
-    }
-
-    YMInstallRoomNameCachePatch();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YMInstallRoomNameCachePatch();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YMInstallRoomNameCachePatch();
     });
 }
 
@@ -5086,7 +5083,6 @@ static void YMWeChatAntiRevokePatchEntry(void) {
         
         YMInstallOpenURLWithSystemBrowserIfNeeded();
         YMInstallAutoLoginIfNeeded();
-        YMInstallRoomNameCacheIfNeeded();
         YMInstallGroupExitMonitorIfNeeded();
         YMInstallAssistantMenu();
         YMInstallAntiUpdateIfNeeded();

@@ -173,7 +173,7 @@
 {
     [self ym_confirmToggleMenuItem:item
                    userDefaultsKey:kRevokeForwardToSelfRealSend
-                   informativeText:@"开启后，撤回的消息将转发到自己的会话，全设备同步。\n需同时开启「消息防撤回」。群聊名称自动获取，无需开启「退群监控」。\n重启微信生效。" needSave:YES];
+                   informativeText:@"开启后，撤回的消息将转发到自己的会话，全设备同步。\n无法获取群名时显示群 ID。\n重启微信生效。" needSave:YES];
 }
 
 - (void)onUseSystemWeb:(NSMenuItem *)item
