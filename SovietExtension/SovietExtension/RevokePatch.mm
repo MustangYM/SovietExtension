@@ -168,7 +168,7 @@ typedef struct {
     uintptr_t revokeDeleteMessagesVA;
 
     uintptr_t openURLWebViewKindVA;
-    uintptr_t sendMsgCGIVA;         // SendMsg CGI（268853: 0x8da920；269079: 0x8e8e64）
+    uintptr_t sendMsgCGIVA; // 268853 0x8da920；269079 历史地址0x8e8e64，仅268853使用。
     uintptr_t roomNameQueryVA;
     YMMediaForwardAddresses mediaForward;
 
@@ -231,7 +231,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeDeleteMessagesVA = 0,
 
         .openURLWebViewKindVA = 0,
-        .sendMsgCGIVA = 0,  // 4.1.9 未适配
+        // 4.1.9 未适配 SendMsg CGI，sendMsgCGIVA 默认0。
         .roomNameQueryVA = 0,
 
         .layout = {
@@ -313,9 +313,9 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .revokeDeleteMessagesVA = 0x2814B9C,//->Lhook->DeleteMessages
 
         .openURLWebViewKindVA = 0x1C7C6AC, //->Lhook->GetUrlWebViewKind
+        // Strings 搜索 "SendMsg"，伪代码中有简短的 " is empty"，用于定位旧文字入口。
+        .sendMsgCGIVA = 0x8DA920, // sub_8da920: SendMsg CGI dispatcher
         
-        //String里"SendMsg",pesudo中有简短的" is empty"
-        .sendMsgCGIVA = 0x8da920,   // sub_8da920: SendMsg CGI dispatcher
         .roomNameQueryVA = 0,
 
         .layout = {
@@ -387,8 +387,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
         .openURLWebViewKindVA = 0x1CAE1E0, //->Lhook->GetUrlWebViewKind
         
-        //String里"SendMsg",pesudo中有简短的" is empty"
-        .sendMsgCGIVA = 0x8E8E64,   // sub_8e8e64: SendMsg CGI dispatcher（269079）
+        // 历史 SendMsg CGI: sub_8e8e64 (0x8E8E64)；Strings "SendMsg" / 伪代码 " is empty" 定位。
+        // 当前改走原生链，sendMsgCGIVA 保持默认0，禁止失败回退。
         .roomNameQueryVA = 0x3830E14,
         // 顺序：MessageWrap 转换、MessageData 析构、单条转发并订阅、插入目标账号。
         .mediaForward = {0x484f234, 0x2e1ff8, 0x1453e34, 0x13b1bb0},
@@ -437,7 +437,8 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .revokeDeleteMessagesVA = 新版 DeleteMessages 函数入口地址，没有就填 0,
          .openURLWebViewKindVA = 新版 GetUrlWebViewKind 函数入口地址，没有就填 0,
 
-         .sendMsgCGIVA = 新版 SendMsg CGI dispatcher 地址 (sub_8da920)，没有就填 0,
+         // 旧文字适配参考：sendMsgCGIVA = SendMsg CGI dispatcher 地址（268853: sub_8da920）。
+         // 新版本默认保持0；若确需兼容此入口，须验证请求ABI并同步更新getter的版本限制。
          .roomNameQueryVA = 已验证会话查询 ABI 的入口地址，没有就填 0，并更新 UUID 和入口指纹,
 
          .layout = {
@@ -890,7 +891,8 @@ uintptr_t getDylibSlide()
 
 uintptr_t YMSendMsgCGIRuntimeAddress(void) {
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
-    if (!profile || profile->sendMsgCGIVA == 0) return 0;
+    // 269079 及未知版本不得在原生链失败时降级到旧 ABI。
+    if (!profile || !profile->buildVersion || strcmp(profile->buildVersion, "268853") != 0) return 0;
     return YMRuntimeAddress(profile->sendMsgCGIVA);
 }
 
@@ -950,6 +952,22 @@ BOOL YMGetMediaForwardAddresses(YMMediaForwardAddresses *addresses) {
     }
     *addresses = {runtime[0], runtime[1], runtime[2], runtime[3]};
     return YES;
+}
+
+uintptr_t YMMessageDataConstructorRuntimeAddress(void) {
+    YMMediaForwardAddresses addresses = {};
+    if (!YMGetMediaForwardAddresses(&addresses)) return 0;
+    // 269079 的 MessageData 默认构造器，原生初始化所有 string、shared_ptr 和容器。
+    // 独立校验：构造器不匹配只禁用生成通知，不影响已有消息的 +1 与媒体转发。
+    const uintptr_t runtime = YMRuntimeAddress(0x48e0f90);
+    static const uint8_t expected[16] = {
+        0x08, 0x2a, 0x02, 0x90, 0x08, 0xe1, 0x14, 0x91,
+        0x08, 0x41, 0x00, 0x91, 0x1f, 0x70, 0x02, 0x78
+    };
+    uint8_t actual[16] = {};
+    if (!runtime || !YMSafeReadMemory(runtime, actual, sizeof(actual)) ||
+        memcmp(actual, expected, sizeof(actual)) != 0) return 0;
+    return runtime;
 }
 
 static inline void *YMRuntimePointer(uintptr_t staticVA) {
@@ -1536,7 +1554,7 @@ static BOOL YMPatchARM64ReturnInt32(uintptr_t address, uint32_t value, const cha
    00 02 1F D6
    hookAddress 8 bytes
  */
-static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
+BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
                                      uintptr_t targetAddress,
                                      const char *name) {
     if (address == 0 || targetAddress == 0) {
@@ -4023,9 +4041,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                 const YMWeChatAdaptProfile *forwardProfile = YMGetActiveProfile();
                 size_t forwardSelfUserOffset = forwardProfile ? forwardProfile->layout.selfUserOffset : 48;
 
-                /*
-                 不能再SelfPatch里猜,直接把自己的id传进去
-                 */
+                // 本人账号来自撤回事件的 rawWrap，不能用原消息的发送者/接收方代替。
                 if (revokeWrap != 0) {
                     forwardSelfUserText = YMNSStringFromLibcppStringObject((const void *)(revokeWrap + forwardSelfUserOffset));
                 }
@@ -4037,6 +4053,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                       revokerWxid ?: @"",
                       revokerDisplayName ?: @"");
 
+                // 按版本发送本人通知及支持的原媒体；下面的会话内撤回提示是独立的本地插入。
                 YMForwardToSelfSend(outWrap,
                                     originType,
                                     originContent,
@@ -4929,6 +4946,7 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
           (unsigned long)vmaddr_slide);
 
     YMRecordWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
+    YMInstallMessageRepeatPatch();
 
     /*
      多开必须尽早 patch。
@@ -5080,6 +5098,7 @@ static void YMWeChatAntiRevokePatchEntry(void) {
         YMLoadFeatureSwitchesFromDefaults();
 
         YMInstallMultiOpenPatch();
+        YMInstallMessageRepeatPatch();
         
         YMInstallOpenURLWithSystemBrowserIfNeeded();
         YMInstallAutoLoginIfNeeded();

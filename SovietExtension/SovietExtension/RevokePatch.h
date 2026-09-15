@@ -14,4 +14,8 @@ void YMLog(NSString *format, ...);
 uintptr_t YMRuntimeAddress(uintptr_t staticVA);
 uintptr_t getDylibSlide();
 
+BOOL YMPatchARM64AbsoluteJump(uintptr_t address, uintptr_t targetAddress, const char *name);
+// dyld 目标镜像加载后尝试安装；已安装或版本/ABI 不匹配时直接返回，不发送消息。
+void YMInstallMessageRepeatPatch(void);
+
 NS_ASSUME_NONNULL_END
