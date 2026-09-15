@@ -543,14 +543,6 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
 {
     Class themeHookClass = NSClassFromString(@"ThemeHook");
 
-    SEL startSelector = @selector(start);
-    if (themeHookClass && [themeHookClass respondsToSelector:startSelector]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [themeHookClass performSelector:startSelector];
-#pragma clang diagnostic pop
-    }
-
     SEL refreshSelector = @selector(refreshAllQNSViews);
     if (themeHookClass && [themeHookClass respondsToSelector:refreshSelector]) {
 #pragma clang diagnostic push
@@ -564,6 +556,7 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
 {
     [self saveSettings:YES];
     [self applyThemeSettingsImmediately];
+    if (self.confirmHandler) self.confirmHandler(YES);
 }
 
 #pragma mark - Actions

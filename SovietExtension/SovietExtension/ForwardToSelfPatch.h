@@ -55,7 +55,8 @@ BOOL YMRevokeRealSendForwardEnabled(void);
 
 /// 撤回消息 → 本人文字通知；269079 对类型 3/43/47/49 同时提交原内容转发。
 /// 通知保留撤回人、内容和时间；文字原文包含在通知中，不再额外发送一条原文。
-/// selfUserText 必须由撤回上下文显式提供；YES 表示通知或媒体已排队，不是送达回执。
+/// selfUserText：269079 须匹配当前登录账号；268853 使用已适配撤回事件的本人字段。
+/// YES 仅表示通知调用或排队成功，不是送达回执。
 BOOL YMForwardToSelfSend(uintptr_t outWrap,
                          uint32_t  originType,
                          NSString *originContent,

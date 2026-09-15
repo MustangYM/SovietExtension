@@ -20,4 +20,12 @@ void YMInstallMessageMenuPatch(void);
 // 只查询本账号已确认撤回的原消息；不受当前保留开关影响。
 BOOL YMIsRetainedSelfMessage(uintptr_t messageData);
 
+typedef NS_ENUM(NSInteger, YMFeatureApplyResult) {
+    YMFeatureApplied,
+    YMFeatureNeedsRestart,
+    YMFeatureUnavailable,
+};
+// 主线程调用；成功后由菜单保存。失败不更改功能开关。
+FOUNDATION_EXPORT YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled);
+
 NS_ASSUME_NONNULL_END

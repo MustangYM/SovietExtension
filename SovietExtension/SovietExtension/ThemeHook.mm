@@ -16,7 +16,6 @@
 #import <math.h>
 #import "RevokePatch.h"
 #import "MistyModeSettingsWindowController.h"
-#import "MenuManager.h"
 #import "YMColorfulBlurBackgroundView.h"
 
 #pragma mark - 默认值
@@ -69,7 +68,10 @@ static YMOneObjectIMP gOrig_QNSView_setLayer = NULL;
 
 static BOOL gYMStarted = NO;
 static BOOL gYMQNSViewHookInstalled = NO;
-static BOOL gYMBlurKeepAliveStarted = NO;
+static NSTimer *gYMBlurKeepAliveTimer = nil;
+static NSHashTable *gYMModifiedThemeObjects;
+static char kYMOriginalThemeStateKey;
+static void YMRestoreThemeObject(id object);
 
 /// 防止处理背景过程中触发 setLayer / view move 后递归。
 static BOOL gYMApplyingBlurBackground = NO;
@@ -144,12 +146,6 @@ static int YMWindowBackgroundBlurRadius(void) {
     NSInteger radius = YMIntegerSetting(kThemeMistyWindowBlurRadius, kYMDefaultWindowBackgroundBlurRadius);
     radius = MAX(0, MIN(100, radius));
     return (int)radius;
-}
-
-static BOOL YMBlurKeepAliveEnabled(void) {
-    // 不再把“自动保持”暴露给用户。内部始终保持开启，
-    // 用于微信 / Qt 重建窗口或切换深浅外观后自动重新应用迷离效果。
-    return YES;
 }
 
 static BOOL YMIsAppearanceDark(NSAppearance *appearance) {
@@ -280,16 +276,8 @@ static BOOL YMIsQNSView(NSView *view) {
 }
 
 static void YMRestoreQNSViewForSkippedWindow(NSView *view) {
-    if (!view) return;
-
-    if ([view respondsToSelector:@selector(setAlphaValue:)]) {
-        view.alphaValue = 1.0;
-    }
-
-    if (view.layer) {
-        view.layer.opaque = NO;
-        view.layer.backgroundColor = NSColor.clearColor.CGColor;
-    }
+    YMRestoreThemeObject(view.layer);
+    YMRestoreThemeObject(view);
 }
 
 static void YMRemoveColorfulBlurBackgroundViewsInTree(NSView *view) {
@@ -309,9 +297,7 @@ static void YMRemoveColorfulBlurBackgroundViewsInTree(NSView *view) {
 static void YMRestoreQNSViewsForSkippedWindowInTree(NSView *view) {
     if (!view) return;
 
-    if (YMIsQNSView(view)) {
-        YMRestoreQNSViewForSkippedWindow(view);
-    }
+    YMRestoreQNSViewForSkippedWindow(view);
 
     NSArray<NSView *> *subviews = [view.subviews copy];
     for (NSView *subview in subviews) {
@@ -320,10 +306,11 @@ static void YMRestoreQNSViewsForSkippedWindowInTree(NSView *view) {
 }
 
 static void YMCleanupMistyArtifactsForSkippedWindow(NSWindow *window) {
-    if (!window || !window.contentView) return;
+    if (!window) return;
 
     YMRemoveColorfulBlurBackgroundViewsInTree(window.contentView);
     YMRestoreQNSViewsForSkippedWindowInTree(window.contentView);
+    YMRestoreThemeObject(window);
 }
 
 
@@ -485,7 +472,7 @@ static BOOL YMResolveCGSBlurSymbolsIfNeeded(void) {
     return ok;
 }
 
-static void YMApplyWindowBackgroundBlur(NSWindow *window) {
+static void YMApplyWindowBackgroundBlur(NSWindow *window, int radius) {
     if (!window) return;
 
     NSInteger windowNumber = window.windowNumber;
@@ -493,8 +480,6 @@ static void YMApplyWindowBackgroundBlur(NSWindow *window) {
         // windowNumber 为 0 通常说明窗口还没真正进入 WindowServer，稍后 refresh 会再应用。
         return;
     }
-
-    int radius = YMWindowBackgroundBlurRadius();
 
     // 如果 radius 为 0，也要调用一次 CGS，把旧 blur 关掉。
     if (!YMResolveCGSBlurSymbolsIfNeeded()) {
@@ -511,6 +496,10 @@ static void YMApplyWindowBackgroundBlur(NSWindow *window) {
 
     YMCGSConnectionID cid = gYMCGSMainConnectionID();
     CGError err = gYMCGSSetWindowBackgroundBlurRadius(cid, (YMCGSWindowID)windowNumber, radius);
+    if (err != kCGErrorSuccess) {
+        YMLog(@"窗口背景模糊应用失败：radius=%d err=%d", radius, err);
+        return;
+    }
 
     objc_setAssociatedObject(window,
                              &kYMAppliedBlurRadiusAssociatedKey,
@@ -526,6 +515,50 @@ static void YMApplyWindowBackgroundBlur(NSWindow *window) {
           (long)windowNumber,
           radius,
           err);
+}
+
+// 快照只记录插件首次改写前的值；layer 独立记录，兼容 Qt 运行中替换 layer。
+static void YMSaveThemeObject(id object) {
+    if (!object || objc_getAssociatedObject(object, &kYMOriginalThemeStateKey)) return;
+    NSDictionary *state;
+    if ([object isKindOfClass:NSWindow.class]) {
+        NSWindow *window = object;
+        state = @{ @"opaque": @(window.opaque), @"color": window.backgroundColor ?: NSNull.null };
+    } else if ([object isKindOfClass:NSView.class]) {
+        NSView *view = object;
+        state = @{ @"alpha": @(view.alphaValue), @"wantsLayer": @(view.wantsLayer) };
+    } else {
+        CALayer *layer = object;
+        state = @{ @"opaque": @(layer.opaque), @"color": (__bridge id)layer.backgroundColor ?: NSNull.null };
+    }
+    objc_setAssociatedObject(object, &kYMOriginalThemeStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!gYMModifiedThemeObjects) gYMModifiedThemeObjects = [NSHashTable weakObjectsHashTable];
+    [gYMModifiedThemeObjects addObject:object];
+}
+
+static void YMRestoreThemeObject(id object) {
+    NSDictionary *state = objc_getAssociatedObject(object, &kYMOriginalThemeStateKey);
+    if (!state) return;
+    // 先消费快照，避免 AppKit 属性 setter 触发回调时重复还原。
+    objc_setAssociatedObject(object, &kYMOriginalThemeStateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [gYMModifiedThemeObjects removeObject:object];
+    id color = state[@"color"] == NSNull.null ? nil : state[@"color"];
+    if ([object isKindOfClass:NSWindow.class]) {
+        NSWindow *window = object;
+        YMApplyWindowBackgroundBlur(window, 0);
+        window.opaque = [state[@"opaque"] boolValue];
+        window.backgroundColor = color;
+    } else if ([object isKindOfClass:NSView.class]) {
+        NSView *view = object;
+        YMRemoveColorfulBlurBackgroundViewsInTree(view);
+        view.alphaValue = [state[@"alpha"] doubleValue];
+        view.wantsLayer = [state[@"wantsLayer"] boolValue];
+        view.needsDisplay = YES;
+    } else {
+        CALayer *layer = object;
+        layer.opaque = [state[@"opaque"] boolValue];
+        layer.backgroundColor = (__bridge CGColorRef)color;
+    }
 }
 
 #pragma mark - Cocoa 层：窗口与 View 透明 / blur carrier
@@ -544,6 +577,7 @@ static NSColor *YMWindowBlurCarrierColor(void) {
 static void YMMakeWindowTransparent(NSWindow *window) {
     if (!window) return;
 
+    YMSaveThemeObject(window);
     window.opaque = NO;
 
     // 不再插入额外 overlay view。
@@ -554,13 +588,15 @@ static void YMMakeWindowTransparent(NSWindow *window) {
     // 保留阴影，整体观感更像系统窗口。
     // window.hasShadow = YES;
 
-    YMApplyWindowBackgroundBlur(window);
+    YMApplyWindowBackgroundBlur(window, YMWindowBackgroundBlurRadius());
 }
 
 static void YMMakeViewTransparent(NSView *view) {
     if (!view) return;
 
+    YMSaveThemeObject(view);
     view.wantsLayer = YES;
+    YMSaveThemeObject(view.layer);
     view.layer.opaque = NO;
     view.layer.backgroundColor = NSColor.clearColor.CGColor;
 
@@ -573,7 +609,9 @@ static void YMMakeViewTransparent(NSView *view) {
 static void YMMakeContainerBlurCarrier(NSView *container) {
     if (!container) return;
 
+    YMSaveThemeObject(container);
     container.wantsLayer = YES;
+    YMSaveThemeObject(container.layer);
     container.layer.opaque = NO;
 
     // 不用额外 view，而是让 contentView / QNSView 父容器自己提供 blur carrier。
@@ -583,7 +621,7 @@ static void YMMakeContainerBlurCarrier(NSView *container) {
 
 static void YMInstallBlurBackgroundBehindQNSView(NSView *qnsView) {
     if (!YMIsQNSView(qnsView)) return;
-    if (gYMApplyingBlurBackground) return;
+    if (gYMApplyingBlurBackground || !YMMistyModeEnabled()) return;
 
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -660,6 +698,17 @@ static void YMRefreshAllWindows(void) {
     }
 
     YMRegisterMistyThemeDefaults();
+    if (!YMMistyModeEnabled()) {
+        [gYMBlurKeepAliveTimer invalidate];
+        gYMBlurKeepAliveTimer = nil;
+        BOOL wasApplying = gYMApplyingBlurBackground;
+        gYMApplyingBlurBackground = YES;
+        for (id object in gYMModifiedThemeObjects.allObjects) {
+            YMRestoreThemeObject(object);
+        }
+        gYMApplyingBlurBackground = wasApplying;
+        return;
+    }
 
     for (NSWindow *window in NSApp.windows) {
         if (!YMShouldApplyMistyEffectForWindow(window)) {
@@ -676,32 +725,20 @@ static void YMRefreshAllWindows(void) {
     }
 }
 
-static void YMBlurKeepAliveTick(void) {
-    if (!gYMBlurKeepAliveStarted) return;
-
-    if (YMBlurKeepAliveEnabled()) {
-        YMRefreshAllWindows();
-    }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kYMBlurKeepAliveInterval * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YMBlurKeepAliveTick();
-    });
-}
-
 static void YMStartBlurKeepAliveIfNeeded(void) {
-    if (gYMBlurKeepAliveStarted) return;
-
-    gYMBlurKeepAliveStarted = YES;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        YMBlurKeepAliveTick();
-    });
+    if (!YMMistyModeEnabled() || gYMBlurKeepAliveTimer) return;
+    gYMBlurKeepAliveTimer = [NSTimer timerWithTimeInterval:kYMBlurKeepAliveInterval repeats:YES block:^(NSTimer *timer) {
+        YMRefreshAllWindows();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:gYMBlurKeepAliveTimer forMode:NSRunLoopCommonModes];
 }
 
 #pragma mark - Runtime Hook：QNSView
 
 static BOOL YM_QNSView_isOpaque(id self, SEL _cmd) {
+    if (!YMMistyModeEnabled()) {
+        return gOrig_QNSView_isOpaque ? gOrig_QNSView_isOpaque(self, _cmd) : YES;
+    }
     if ([self isKindOfClass:[NSView class]]) {
         NSWindow *window = ((NSView *)self).window;
         if (window && !YMShouldApplyMistyEffectForWindow(window)) {
@@ -740,7 +777,7 @@ static void YM_QNSView_setLayer(id self, SEL _cmd, id layer) {
         gOrig_QNSView_setLayer(self, _cmd, layer);
     }
 
-    if ([self isKindOfClass:[NSView class]]) {
+    if (YMMistyModeEnabled() && !gYMApplyingBlurBackground && [self isKindOfClass:[NSView class]]) {
         NSView *view = (NSView *)self;
         NSWindow *window = view.window;
 
@@ -771,7 +808,11 @@ static void YMReplaceInstanceMethodOnce(Class cls, SEL sel, IMP newImp, IMP *old
         return;
     }
 
-    IMP oldImp = method_setImplementation(method, newImp);
+    // 继承的方法应添加到 QNSView，不能改写 NSView 的实现。
+    IMP oldImp = currentImp;
+    if (!class_addMethod(cls, sel, newImp, method_getTypeEncoding(method))) {
+        oldImp = method_setImplementation(method, newImp);
+    }
 
     // 只在第一次保存原始 IMP。
     if (oldImpStorage && *oldImpStorage == NULL) {
@@ -820,53 +861,41 @@ static void YMInstallQNSViewHooks(void) {
 @implementation ThemeHook
 
 + (void)start {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    BOOL mistyEnabled = [defaults boolForKey:kThemeMistyMode];
-    if (!mistyEnabled) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self start]; });
         return;
     }
-    
-    
-    if (gYMStarted) {
+    YMRegisterMistyThemeDefaults();
+    if (!YMMistyModeEnabled()) {
+        YMRefreshAllWindows();
         return;
     }
 
+    YMInstallQNSViewHooks();
+    YMRefreshAllWindows();
+    YMStartBlurKeepAliveIfNeeded();
+    if (gYMStarted) return;
     gYMStarted = YES;
 
-    YMLog(@"start");
-
-    [MenuManager shareInstance].hasLoadMistyHook = YES;
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        YMRegisterMistyThemeDefaults();
-        YMInstallQNSViewHooks();
-        YMRefreshAllWindows();
-        YMStartBlurKeepAliveIfNeeded();
-
-        // 微信 / Qt 有些窗口和 layer 会延后创建，所以延迟再刷几次。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Qt 可能延迟注册 QNSView；重试只安装一次，关闭后不重新应用主题。
+    for (NSNumber *delay in @[@1, @3]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!YMMistyModeEnabled()) return;
             YMInstallQNSViewHooks();
             YMRefreshAllWindows();
         });
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            YMInstallQNSViewHooks();
-            YMRefreshAllWindows();
-        });
-    });
+    }
 }
 
 + (void)setBackgroundImagePath:(NSString *)path {
     // 当前版本已经从背景图 / NSVisualEffectView 切换为 WindowServer 可调背景模糊。
     // 保留这个接口只是为了兼容旧调用，避免外部代码调用时报错。
     (void)path;
-    YMRefreshAllWindows();
+    [self refreshAllQNSViews];
 }
 
 + (void)refreshAllQNSViews {
-    YMRegisterMistyThemeDefaults();
-    YMRefreshAllWindows();
-    YMStartBlurKeepAliveIfNeeded();
+    [self start];
 }
 
 @end

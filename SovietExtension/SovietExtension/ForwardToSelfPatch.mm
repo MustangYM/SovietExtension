@@ -68,6 +68,7 @@
 //
 
 #import "ForwardToSelfPatch.h"
+#import "SelfRevokePatch.h"
 #import <objc/message.h>
 
 #include <string>
@@ -162,37 +163,14 @@ static BOOL YMForwardLooksLikeAccountID(NSString *value) {
     return YMForwardStringMatchesPattern(text, @"^[A-Za-z0-9_\\-]{5,128}$");
 }
 
-static BOOL YMForwardLooksLikeSafeSelfID(NSString *selfId,
-                                         NSString *sessionText,
-                                         NSString *revokerWxid,
-                                         NSString *revokerDisplayName) {
+static BOOL YMForwardLooksLikeSafeSelfID(NSString *selfId) {
     NSString *value = YMForwardTrim(selfId);
-    NSString *session = YMForwardTrim(sessionText);
-    NSString *revoker = YMForwardTrim(revokerWxid);
-
-    if (!YMForwardLooksLikeAccountID(value)) {
-        return NO;
-    }
-
-    // 绝对不能把目标设成群。
-    if ([value containsString:@"@chatroom"]) {
-        return NO;
-    }
-
-    // 私聊场景下，如果目标等于当前会话，极可能就是误把对方当自己。
-    // 自己和自己的会话也可能相等，但宁可跳过，也不能误发给别人。
-    if (session.length > 0 && [value isEqualToString:session]) {
-        return NO;
-    }
-
-    // 如果 revoker 不是“你”，但 selfId 却等于 revoker，也高度可疑。
-    // 这种情况可能是把撤回人/原发送者误当成当前登录账号。
-    BOOL displayMeansMe = [revokerDisplayName isEqualToString:@"你"];
-    if (revoker.length > 0 && [value isEqualToString:revoker] && !displayMeansMe) {
-        return NO;
-    }
-
-    return YES;
+    // 原生发送仅适配具有可信账号查询的版本。账号不可用或已切换时拒绝发送，
+    // 不通过会话方向或撤回人的昵称猜测接收方。
+    NSString *account = YMSelfRevokeAccount();
+    return YMForwardLooksLikeAccountID(value) &&
+           ![value containsString:@"@chatroom"] &&
+           account.length > 0 && [value isEqualToString:account];
 }
 
 #pragma mark - 格式化辅助
@@ -392,7 +370,7 @@ static BOOL YMSubmitMessageToSession(const YMForwardMessageData *message,
 
 // selfId 必须先通过 YMForwardLooksLikeSafeSelfID；只为新通知构造对象，不修改原消息快照。
 static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
-    if (!selfId.length || !content.length) return NO;
+    if (!YMForwardLooksLikeSafeSelfID(selfId) || !content.length) return NO;
     YMMediaForwardAddresses addresses = {};
     if (!YMGetMediaForwardAddresses(&addresses)) return NO;
     uintptr_t construct = YMMessageDataConstructorRuntimeAddress();
@@ -437,7 +415,7 @@ static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
     }
 }
 
-static BOOL YMForwardNativeToSession(uintptr_t outWrap, uint32_t originType, NSString *sessionID) {
+static BOOL YMForwardNativeToSession(uintptr_t outWrap, uint32_t originType, NSString *sessionID, BOOL toSelf = NO) {
     if (!outWrap || !YMForwardSupportsMessageType(originType)) return NO;
     YMMediaForwardAddresses addresses = {};
     if (!YMGetMediaForwardAddresses(&addresses) || !addresses.fromWrap || !addresses.destruct ||
@@ -473,11 +451,13 @@ static BOOL YMForwardNativeToSession(uintptr_t outWrap, uint32_t originType, NSS
         memcpy(&convertedID, (const uint8_t *)message.get() + 0x90, sizeof(convertedID));
         if (convertedType == originType && convertedID == sourceID) {
             if ([NSThread isMainThread]) {
-                submitted = YMSubmitMessageToSession(message.get(), sessionID, addresses);
+                submitted = (!toSelf || YMForwardLooksLikeSafeSelfID(sessionID)) &&
+                            YMSubmitMessageToSession(message.get(), sessionID, addresses);
             } else {
                 // 原撤回回调可能不在主线程；先转换并持有数据，不跨线程保留 outWrap 裸指针。
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    YMSubmitMessageToSession(message.get(), sessionID, addresses);
+                    if (!toSelf || YMForwardLooksLikeSafeSelfID(sessionID))
+                        YMSubmitMessageToSession(message.get(), sessionID, addresses);
                 });
                 submitted = YES;
             }
@@ -536,7 +516,7 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
     BOOL safeSelf = legacySend
         ? ![selfId isEqualToString:@"filehelper"] &&
           YMForwardStringMatchesPattern(selfId, @"^[A-Za-z0-9_\\-]{5,128}$")
-        : YMForwardLooksLikeSafeSelfID(selfId, sessionText, revokerWxid, revokerDisplayName);
+        : YMForwardLooksLikeSafeSelfID(selfId);
     if (!safeSelf) {
         YMForwardLog(@"unsafe selfId, skip real send. selfId=%@ session=%@ revoker=%@ displayName=%@ type=%u",
                      selfId ?: @"",
@@ -550,7 +530,7 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
     // 撤回文字只发包含原文的通知，避免额外转发一条原文。
     // 支持的非文字消息与 +1 共用原生转发链，另行发送撤回通知；排队不代表送达。
     BOOL mediaSubmitted = !legacySend && (originType == 3 || originType == 43 || originType == 47 || originType == 49) &&
-                          YMForwardNativeToSession(outWrap, originType, selfId);
+                          YMForwardNativeToSession(outWrap, originType, selfId, YES);
     NSString *notice = YMBuildRevokeForwardNotice(sessionText ?: @"",
                                                   originType,
                                                   originContent ?: @"",
