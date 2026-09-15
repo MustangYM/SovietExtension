@@ -4947,7 +4947,7 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
           (unsigned long)vmaddr_slide);
 
     YMRecordWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
-    YMInstallMessageRepeatPatch();
+    YMInstallMessageMenuPatch();
 
     /*
      多开必须尽早 patch。
@@ -5100,7 +5100,7 @@ static void YMWeChatAntiRevokePatchEntry(void) {
         YMLoadFeatureSwitchesFromDefaults();
 
         YMInstallMultiOpenPatch();
-        YMInstallMessageRepeatPatch();
+        YMInstallMessageMenuPatch();
         
         YMInstallOpenURLWithSystemBrowserIfNeeded();
         YMInstallAutoLoginIfNeeded();
