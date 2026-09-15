@@ -23,6 +23,9 @@
 #import <objc/message.h>
 #import "ForwardToSelfPatch.h"
 #import "MenuManager.h"
+#import "RevokeSettings.h"
+#import "SelfRevokeLedger.h"
+#import "SelfRevokePatch.h"
 #import "NSObject+MainHook.h"
 
 #include <string>
@@ -873,6 +876,11 @@ static const YMWeChatAdaptProfile *YMGetActiveProfile(void) {
 
     YMActiveProfile = YMFindAdaptProfileForCurrentWeChat();
     return YMActiveProfile;
+}
+
+static BOOL YMShouldInstallRevokeHooks(void) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    return (profile && strcmp(profile->buildVersion, "269079") == 0) || YMIsAntiRevokeEnabled();
 }
 
 #pragma mark - 地址辅助
@@ -3853,6 +3861,60 @@ static BOOL YMFindRevokeContextAroundCallsite(uintptr_t originalSP,
     return NO;
 }
 
+// Pure presentation shared by native self notices and the existing others notice.
+static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
+                                                NSString *originRawContent,
+                                                uint64_t originCreateTimeMs,
+                                                uint32_t originCreateTimeSec,
+                                                NSString *revokerWxid,
+                                                NSString *revokerDisplayName,
+                                                BOOL preserveContent) {
+    NSString *sender = @"";
+    NSString *cleanContent = @"";
+    BOOL shouldShowContent = YMRevokeMessageTypeShouldShowContent(originType);
+
+    if (shouldShowContent) {
+        cleanContent = preserveContent ? (originRawContent ?: @"") : YMCleanOriginMessageContent(originRawContent, &sender);
+        if (!preserveContent && YMRevokeOriginTextLooksUseless(cleanContent)) {
+            shouldShowContent = NO;
+            cleanContent = @"";
+            sender = @"";
+        }
+    }
+
+    NSString *timeText = YMFormatTimestamp(originCreateTimeSec, originCreateTimeMs);
+
+    NSMutableString *notice = [NSMutableString string];
+    [notice appendString:@"⚠️苏维埃已拦截撤回消息⚠️\n"];
+    [notice appendFormat:@"%@\n", YMRevokeMessageTypeName(originType)];
+
+    if (shouldShowContent) {
+        if (cleanContent.length > 0) {
+            if (cleanContent.length > 1200) {
+                NSUInteger end = [cleanContent rangeOfComposedCharacterSequenceAtIndex:1200].location;
+                cleanContent = [[cleanContent substringToIndex:end] stringByAppendingString:@"…"];
+            }
+            [notice appendFormat:@"内容：%@\n", cleanContent];
+        } else {
+            [notice appendString:@"内容：（空）\n"];
+        }
+    }
+
+    if (revokerDisplayName.length > 0 && revokerWxid.length > 0) {
+        [notice appendFormat:@"%@（%@）\n", revokerDisplayName, revokerWxid];
+    } else if (revokerDisplayName.length > 0) {
+        [notice appendFormat:@"%@\n", revokerDisplayName];
+    } else if (revokerWxid.length > 0) {
+        [notice appendFormat:@"%@\n", revokerWxid];
+    }
+    
+    if (timeText.length > 0) {
+        [notice appendString:timeText];
+    }
+
+    return notice;
+}
+
 static BOOL YMInsertDetailedAntiRevokeNoticeFromOrigin(std::string *sessionString,
                                                        NSString *sessionText,
                                                        uint64_t svrId,
@@ -3879,47 +3941,8 @@ static BOOL YMInsertDetailedAntiRevokeNoticeFromOrigin(std::string *sessionStrin
         return NO;
     }
 
-    NSString *sender = @"";
-    NSString *cleanContent = @"";
-    BOOL shouldShowContent = YMRevokeMessageTypeShouldShowContent(originType);
-
-    if (shouldShowContent) {
-        cleanContent = YMCleanOriginMessageContent(originRawContent, &sender);
-        if (YMRevokeOriginTextLooksUseless(cleanContent)) {
-            shouldShowContent = NO;
-            cleanContent = @"";
-            sender = @"";
-        }
-    }
-
-    NSString *timeText = YMFormatTimestamp(originCreateTimeSec, originCreateTimeMs);
-
-    NSMutableString *notice = [NSMutableString string];
-    [notice appendString:@"⚠️苏维埃已拦截撤回消息⚠️\n"];
-    [notice appendFormat:@"%@\n", YMRevokeMessageTypeName(originType)];
-
-    if (shouldShowContent) {
-        if (cleanContent.length > 0) {
-            if (cleanContent.length > 1200) {
-                cleanContent = [[cleanContent substringToIndex:1200] stringByAppendingString:@"…"];
-            }
-            [notice appendFormat:@"内容：%@\n", cleanContent];
-        } else {
-            [notice appendString:@"内容：（空）\n"];
-        }
-    }
-
-    if (revokerDisplayName.length > 0 && revokerWxid.length > 0) {
-        [notice appendFormat:@"%@（%@）\n", revokerDisplayName, revokerWxid];
-    } else if (revokerDisplayName.length > 0) {
-        [notice appendFormat:@"%@\n", revokerDisplayName];
-    } else if (revokerWxid.length > 0) {
-        [notice appendFormat:@"%@\n", revokerWxid];
-    }
-    
-    if (timeText.length > 0) {
-        [notice appendString:timeText];
-    }
+    NSString *notice = YMBuildDetailedAntiRevokeNotice(originType, originRawContent,
+        originCreateTimeMs, originCreateTimeSec, revokerWxid, revokerDisplayName, NO);
 
     std::string content = YMStdStringFromNSString(notice);
 
@@ -3937,6 +3960,79 @@ static BOOL YMInsertDetailedAntiRevokeNoticeFromOrigin(std::string *sessionStrin
 
     YMLog(@"[RevokeCallsite] insert detailed notice result=0x%llx", (unsigned long long)result);
     return YES;
+}
+
+NSString *YMBuildSelfRevokeNotice(uintptr_t originalWrap, uintptr_t revokeExt) {
+    if (!originalWrap || !YMIsOwnRevokeWrap(originalWrap)) return nil;
+    uint32_t type = 0, createTimeSec = 0;
+    uint64_t createTimeMs = 0;
+    if (!YMSafeReadMemory(originalWrap + 0x0C, &type, sizeof(type)) ||
+        !YMSafeReadMemory(originalWrap + 0x114, &createTimeSec, sizeof(createTimeSec)) ||
+        !YMSafeReadMemory(originalWrap + 0x100, &createTimeMs, sizeof(createTimeMs))) return nil;
+    NSString *account = YMSelfRevokeAccount();
+    if (!account.length) return nil;
+    // This is the live original Wrap held by the revoke coroutine. Reuse the
+    // native string reader so long messages still produce the existing 1200-char summary.
+    NSString *content = YMRevokeMessageTypeShouldShowContent(type) ?
+        YMNSStringFromStdString((const std::string *)(originalWrap + 0x130)) : @"";
+    if (!content) return nil;
+    NSString *replaceMsg = revokeExt ? YMNSStringFromLibcppStringObject((const void *)(revokeExt + 0x170)) : @"";
+    NSString *displayName = YMDisplayNameFromRevokeReplaceMsg(replaceMsg);
+    if (!displayName.length) displayName = @"你";
+    return YMBuildDetailedAntiRevokeNotice(type, content, createTimeMs, createTimeSec,
+                                          account, displayName, YES);
+}
+
+NSString *YMSelfRevokeWrapIdentity(uintptr_t wrap) {
+    if (!wrap || !YMIsOwnRevokeWrap(wrap)) return nil;
+    uint64_t serverID = 0;
+    uint32_t localID = 0;
+    if (!YMSafeReadMemory(wrap + 0xF8, &serverID, sizeof(serverID)) ||
+        !YMSafeReadMemory(wrap + 0xF4, &localID, sizeof(localID))) return nil;
+    return YMSelfRevokeIdentity(YMSelfRevokeAccount(), YMSelfRevokeSession(wrap), serverID, localID);
+}
+
+bool YMWasSelfRevokeNoticeInserted(NSString *identity) {
+    return YMSelfRevokeNoticeLocalID(NSUserDefaults.standardUserDefaults, identity) != 0;
+}
+
+void YMRecordRetainedSelfRevoke(NSString *identity, uint32_t noticeLocalId) {
+    // identity 已在事件开始通过当前账号验证，并由事件持有；异步完成不改归属。
+    YMRecordSelfRevoke(NSUserDefaults.standardUserDefaults, identity, noticeLocalId);
+}
+
+uint64_t YMRetainedSelfRevokeOriginalID(uintptr_t systemWrap) {
+    uint64_t serverID = 0;
+    uint32_t localID = 0, type = 0;
+    uintptr_t ext = 0;
+    if (!systemWrap ||
+        !YMSafeReadMemory(systemWrap + 0xF8, &serverID, sizeof(serverID)) || serverID != 0 ||
+        !YMSafeReadMemory(systemWrap + 0xF4, &localID, sizeof(localID)) || !localID ||
+        !YMSafeReadMemory(systemWrap + 0x0C, &type, sizeof(type)) || type != 10000 ||
+        !YMSafeReadPointer(systemWrap + 0x210, &ext) || !ext ||
+        ![YMNSStringFromLibcppStringObject((void *)(ext + 0x148)) isEqualToString:@"revokemsg"]) return 0;
+    // 原生重建提示 XML 不包含原消息 ID；以持久化提示身份关联，不能读 ext+0x168。
+    return YMSelfRevokeOriginalID(NSUserDefaults.standardUserDefaults, YMSelfRevokeAccount(),
+                                  YMSelfRevokeSession(systemWrap), localID);
+}
+
+bool YMIsSelfRevokeNotice(uintptr_t systemWrap) {
+    return YMRetainedSelfRevokeOriginalID(systemWrap) != 0;
+}
+
+BOOL YMIsRetainedSelfMessage(uintptr_t messageData) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!messageData || !profile || strcmp(profile->buildVersion, "269079") != 0) return NO;
+    uint64_t serverID = 0;
+    uint32_t localID = 0;
+    if (!YMSafeReadMemory(messageData + 0x90, &serverID, sizeof(serverID)) ||
+        !YMSafeReadMemory(messageData + 0x74, &localID, sizeof(localID))) return NO;
+    NSString *sender = YMNSStringFromLibcppStringObject((void *)(messageData + 0x10));
+    NSString *session = YMNSStringFromLibcppStringObject((void *)(messageData + 0x58));
+    if (![sender isEqualToString:YMSelfRevokeAccount()]) return NO;
+    // 记录时已通过原生当前账号谓词；sender 是这条本人原消息的账号身份。
+    return YMHasSelfRevoke(NSUserDefaults.standardUserDefaults,
+                          YMSelfRevokeIdentity(sender, session, serverID, localID));
 }
 
 extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t savedRegs) {
@@ -3961,6 +4057,30 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
 
         if (extObject == 0 || hasValue == 0) {
             return;
+        }
+
+        const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+        const BOOL supportedSelf = profile && strcmp(profile->buildVersion, "269079") == 0;
+        const YMRevokeSettings policy = YMReadRevokeSettings(NSUserDefaults.standardUserDefaults);
+        // 账号尚不可用时不把未知身份归到他人策略。
+        if (supportedSelf && !YMSelfRevokeAccount().length) return;
+        const BOOL own = supportedSelf && YMIsOwnRevokeWrap(outWrap);
+        const BOOL forward = (supportedSelf ? policy.others : YMIsAntiRevokeEnabled()) &&
+                             YMRevokeRealSendForwardEnabled();
+        if (supportedSelf) {
+            if (own) {
+                const BOOL retain = policy.self || YMHasSelfRevoke(NSUserDefaults.standardUserDefaults,
+                                                                   YMSelfRevokeWrapIdentity(outWrap));
+                if (!YMPrepareSelfRevoke(originalSP, retain)) {
+                    // 不允许注册失败后销毁用户要求保留的原消息。
+                    if (retain) *((volatile uint8_t *)(outWrap + 616)) = 0;
+                    YMLog(@"[SelfRevoke] event unavailable; retain=%d native reedit not guaranteed", retain);
+                    return;
+                }
+                if (!forward) return;
+            } else if (!policy.others) {
+                return;
+            }
         }
 
         uint64_t svrId = 0;
@@ -4032,12 +4152,26 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
               newMsgID ?: @"",
               revokeXML ?: @"");
 
-        // 去重：根据实际撤回条数动态增长集合
-        if (!YMRevokeSeenSvrIds) YMRevokeSeenSvrIds = new std::set<uint64_t>();
-        bool alreadySeen = YMRevokeSeenSvrIds->count(svrId) > 0;
-        if (!alreadySeen) {
+        bool alreadySeen = false;
+        if (supportedSelf) {
+            static NSMutableSet<NSString *> *seen;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+            uint32_t localID = 0;
+            YMSafeReadMemory(outWrap + 0xF4, &localID, sizeof(localID));
+            NSString *identity = YMSelfRevokeIdentity(YMSelfRevokeAccount(), sessionText, svrId, localID);
+            if (!identity) return;
+            @synchronized(seen) {
+                alreadySeen = [seen containsObject:identity];
+                [seen addObject:identity];
+            }
+        } else {
+            if (!YMRevokeSeenSvrIds) YMRevokeSeenSvrIds = new std::set<uint64_t>();
+            alreadySeen = YMRevokeSeenSvrIds->count(svrId) > 0;
             YMRevokeSeenSvrIds->insert(svrId);
-            if (YMRevokeRealSendForwardEnabled()) {
+        }
+        if (!alreadySeen) {
+            if (forward) {
                 NSString *forwardSelfUserText = @"";
                 const YMWeChatAdaptProfile *forwardProfile = YMGetActiveProfile();
                 size_t forwardSelfUserOffset = forwardProfile ? forwardProfile->layout.selfUserOffset : 48;
@@ -4063,7 +4197,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                                     revokerWxid,
                                     revokerDisplayName);
             }
-            YMInsertDetailedAntiRevokeNoticeFromOrigin(sessionString,
+            if (!own) YMInsertDetailedAntiRevokeNoticeFromOrigin(sessionString,
                                                        sessionText,
                                                        svrId,
                                                        originType,
@@ -4080,9 +4214,9 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
                   (unsigned long long)svrId);
         }
 
-        // 原消息已经拿到了，后面就别让微信拿这个 __dst 继续搞撤回 UI 了。
-        // 先只清 flag，不析构这个栈上 MessageWrap。
-        // 这是试水版本，目的是确认后面的撤回 UI 能不能被绕掉。
+        if (own) return; // 本人路径只由已冻结的原生删除/替换策略控制。
+
+        // 他人防撤回继续沿用现有本地提示与保留路径。
         *((volatile uint8_t *)(outWrap + 616)) = 0;
         YMLog(@"[RevokeCallsite] clear local origin optional flag to prevent current UI revoke replacement");
     }
@@ -4320,6 +4454,9 @@ static BOOL YMPatchRevokeLocalCallsiteOnly(uintptr_t slide, NSString *source) {
               profile->displayName);
         return NO;
     }
+
+    const BOOL nativeSelf = strcmp(profile->buildVersion, "269079") == 0;
+    if (nativeSelf) return YMInstallSelfRevokePatch();
 
     uintptr_t callsite = slide + profile->revokeOriginCallsiteAfterQueryVA;
 
@@ -4964,7 +5101,7 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
         YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 
-    if (YMIsAntiRevokeEnabled()) {
+    if (YMShouldInstallRevokeHooks()) {
         YMPatchAntiRevokeWithSlide(vmaddr_slide, @"dyld add image callback");
     }
 }
@@ -5003,8 +5140,8 @@ static void YMInstallAntiUpdateIfNeeded(void) {
 }
 
 static void YMInstallAntiRevokeIfNeeded(void) {
-    if (!YMIsAntiRevokeEnabled()) {
-        YMLog(@"anti revoke disabled, skip");
+    if (!YMShouldInstallRevokeHooks()) {
+        YMLog(@"anti revoke disabled on legacy build, skip");
         return;
     }
 
@@ -5073,6 +5210,7 @@ static void YMLoadFeatureSwitchesFromDefaults(void) {
         [defaults setObject:@"SOVIET" forKey:kIsFirstLoad];
     }
 
+    YMRegisterSelfRevokeDefault(defaults);
     YMFeatureAntiUpdateEnabled = [defaults boolForKey:kAntiUpdate];
     YMFeatureAntiRevokeEnabled = [defaults boolForKey:kAntiRevoke];
     YMFeatureGroupExitMonitorEnabled = [defaults boolForKey:kExitChatroom];

@@ -100,6 +100,7 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
     std::vector<Pending> pending;
     std::vector<int32_t> nativeKeys;
     std::vector<uintptr_t> priorActions;
+    bool hideRevoke = false;
     if (caller == YMRuntimeAddress(0x530330) && [NSThread isMainThread]) {
         try {
             uintptr_t begin = 0, end = 0, vtable = 0;
@@ -111,6 +112,13 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
             uint64_t identifier = 0;
             memcpy(&type, (void *)(source + 8), 4);
             memcpy(&identifier, (void *)(source + 0x90), 8);
+            const bool validEntries = begin && end > begin && end - begin <= 64 * 0x170 &&
+                (end - begin) % 0x170 == 0 && vtable == YMRuntimeAddress(0x8e20548);
+            if (validEntries) {
+                hideRevoke = YMIsRetainedSelfMessage(source);
+                for (uintptr_t entry = begin; entry < end; entry += 0x170)
+                    nativeKeys.push_back(*(const int32_t *)entry);
+            }
             // 模型菜单条目跨度为 0x170；首项 +0x48 提供原生样式，消息快照位于 model+0x120。
             // +0x58 是按消息方向解析的原会话；文字/图片/视频/表情包/应用消息共用类型门控。
             if (begin && end > begin && end - begin <= 64 * 0x170 && (end - begin) % 0x170 == 0 &&
@@ -129,7 +137,6 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
                         // 用key去重和定位，不依赖本地化标题。
                         bool hasFinder = false, hasSave = false;
                         for (uintptr_t entry = begin; entry < end; entry += 0x170) {
-                            nativeKeys.push_back(*(const int32_t *)entry);
                             if (*(const uint32_t *)entry == 0xbbf) hasFinder = true;
                             if (*(const uint32_t *)entry == 0xbc1) hasSave = true;
                         }
@@ -158,12 +165,12 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
 
     // 原构建器在 0x951128..0x951144 销毁模型条目，所以样式复制和消息快照必须提前完成。
     // 返回后只使用自己构造的 item 和 callback，不能再读取 begin/end 指向的旧条目。
-    if (!pending.empty()) {
+    if (!pending.empty() || hideRevoke) {
         auto prior = ((YMMessageMenuActions (*)(uintptr_t))YMRuntimeAddress(0x5cc1e08))(menu);
         for (int i = 0; uintptr_t action = prior.at(i); ++i) priorActions.push_back(action);
     }
     YMMessageMenuOriginalBuilder(model, menu, fillNames);
-    if (pending.empty()) return;
+    if (pending.empty() && !hideRevoke) return;
     try {
         using GetActions = YMMessageMenuActions (*)(uintptr_t);
         using InsertAction = void (*)(uintptr_t, uintptr_t, uintptr_t);
@@ -191,6 +198,10 @@ static void YMMessageMenuBuilder(uintptr_t model, uintptr_t menu, bool fillNames
             for (size_t i = 0; i < layout.size(); ++i) {
                 uintptr_t action = original.at((int)(priorActions.size() + i));
                 if (layout[i] == 0xbc1) save = action;
+                if (hideRevoke && (layout[i] == 4001 || layout[i] == 4002)) {
+                    ((void (*)(uintptr_t, bool))YMRuntimeAddress(0x5c916b8))(action, false);
+                    continue;
+                }
                 // 原生4000组含撤回(4001/4002)、删除(4003)，取首项，不能只锚定删除。
                 if (!destructive && layout[i] / 1000 == 4) destructive = action;
                 if (layout[i] == -1) separators.push_back(action);
@@ -244,6 +255,7 @@ void YMInstallMessageMenuPatch(void) {
     if (!YMGetMediaForwardAddresses(&addresses)) return;
     struct Entry { uintptr_t offset; uint8_t bytes[16]; };
     static const Entry entries[] = {
+        {0x5c916b8, {0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xe8, 0x03, 0x01, 0xaa}},
         {0x51b288, {0x48, 0xf4, 0x81, 0x52, 0xe8, 0x43, 0x00, 0xb9, 0x37, 0x50, 0x11, 0x95, 0x20, 0x15, 0x00, 0xb4}},
         {0x951268, {0x08, 0x00, 0x40, 0xb9, 0x29, 0x00, 0x40, 0xb9, 0x1f, 0x01, 0x09, 0x6b, 0xe0, 0xa7, 0x9f, 0x1a}},
         {0x950bac, {0xe9, 0x22, 0x05, 0xd1, 0x29, 0x01, 0x80, 0xb9, 0x6a, 0xba, 0x89, 0x52, 0x4a, 0x0c, 0xa2, 0x72}},

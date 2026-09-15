@@ -10,6 +10,7 @@
 #import "NSMenu+Action.h"
 #import "YMSwizzledHelper.h"
 #import "MistyModeSettingsWindowController.h"
+#import "RevokeSettings.h"
 
 #ifndef kExitChatroomNickname
 #define kExitChatroomNickname @"YMExitChatroomNickname"
@@ -37,6 +38,7 @@
 
 - (void)initAssistantMenuItems
 {
+    YMRegisterSelfRevokeDefault([NSUserDefaults standardUserDefaults]);
     [self ym_registerDefaultBool:NO forKey:kExitChatroomNick];
     [MistyModeSettingsWindowController registerDefaults];
 
@@ -44,9 +46,13 @@
                                                               key:kAntiUpdate
                                                            action:@selector(onAntiUpdate:)];
     
-    NSMenuItem *antiRevokeMenu = [self ym_toggleMenuItemWithTitle:@"消息防撤回"
+    BOOL separateRevoke = [[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"];
+    NSMenuItem *antiRevokeMenu = [self ym_toggleMenuItemWithTitle:separateRevoke ? @"他人消息防撤回" : @"消息防撤回"
                                                               key:kAntiRevoke
                                                            action:@selector(onAntiRevoke:)];
+    NSMenuItem *selfAntiRevokeMenu = [self ym_toggleMenuItemWithTitle:@"本人消息防撤回"
+                                                              key:kSelfAntiRevoke
+                                                           action:@selector(onSelfAntiRevoke:)];
     
     BOOL flag_forward = [[NSUserDefaults standardUserDefaults] boolForKey:kRevokeForwardToSelfRealSend];
     NSMenuItem *forwardMenu = [NSMenuItem menuItemWithTitle:@"撤回同步到手机(文字提醒)"
@@ -56,10 +62,9 @@
                                                       state:flag_forward];
     
     NSMenu *revokeGroupSub = [[NSMenu alloc] initWithTitle:@"消息撤回"];
-    [revokeGroupSub addItems:@[
-        antiRevokeMenu,
-        forwardMenu,
-    ]];
+    [revokeGroupSub addItem:antiRevokeMenu];
+    if (separateRevoke) [revokeGroupSub addItem:selfAntiRevokeMenu];
+    [revokeGroupSub addItem:forwardMenu];
     
     NSMenuItem *revokeGroup = [[NSMenuItem alloc] init];
     revokeGroup.title = @"消息撤回";
@@ -143,9 +148,17 @@
 
 - (void)onAntiRevoke:(NSMenuItem *)item
 {
-    [self ym_confirmToggleMenuItem:item
-                   userDefaultsKey:kAntiRevoke
-                   informativeText:@"重启微信生效" needSave:YES];
+    if (![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
+        [self ym_confirmToggleMenuItem:item userDefaultsKey:kAntiRevoke
+                       informativeText:@"重启微信生效" needSave:YES];
+        return;
+    }
+    [self ym_setMenuItem:item enabled:item.state != NSControlStateValueOn userDefaultsKey:kAntiRevoke];
+}
+
+- (void)onSelfAntiRevoke:(NSMenuItem *)item
+{
+    [self ym_setMenuItem:item enabled:item.state != NSControlStateValueOn userDefaultsKey:kSelfAntiRevoke];
 }
 
 - (void)onExitChatroom:(NSMenuItem *)item
