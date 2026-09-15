@@ -8,6 +8,7 @@
 //         -- MustangYM 2026-6-16
 
 #import "RevokePatch.h"
+#import "StartupPermission.h"
 #import "AntiUpdate.h"
 #import "AutoLogin.h"
 #import <Foundation/Foundation.h>
@@ -5092,6 +5093,7 @@ static void YMLoadFeatureSwitchesFromDefaults(void) {
 
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
+    SOVEXTCheckStartupPermission();
     @autoreleasepool {
         YMLog(@"constructor called");
         

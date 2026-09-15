@@ -101,6 +101,8 @@ sh install.sh
 sh /Users/mustangym/SovietExtension/SovietExtension/Rely/install.sh
 ```
 
+安装后打开微信，如出现权限提示，请按引导完成授权。
+
 安装过程示例：
 
 ```text

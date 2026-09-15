@@ -5,6 +5,7 @@
 //
 
 #import "ThemeHook.h"
+#import "StartupPermission.h"
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -872,6 +873,7 @@ static void YMInstallQNSViewHooks(void) {
 
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
+    SOVEXTCheckStartupPermission();
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{
             [ThemeHook start];
