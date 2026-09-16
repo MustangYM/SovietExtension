@@ -69,6 +69,7 @@
 
 #import "ForwardToSelfPatch.h"
 #import "SelfRevokePatch.h"
+#import "QuotedReply.h"
 #import <objc/message.h>
 
 #include <string>
@@ -247,11 +248,13 @@ static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
         }
     }
 
+    BOOL textReply = NO;
+    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply);
     if (clean.length > 1600) {
         clean = [[clean substringToIndex:1600] stringByAppendingString:@"…"];
     }
 
-    NSString *contentDisplay = YMForwardContentDisplay(originType, clean);
+    NSString *contentDisplay = quote ?: YMForwardContentDisplay(originType, clean);
     NSString *revokerDisplay = YMForwardRevokerDisplay(revokerDisplayName, revokerWxid, sender);
 
     NSMutableString *notice = [NSMutableString string];
@@ -263,9 +266,9 @@ static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
     }
 
     [notice appendFormat:@"撤回人:%@\n", revokerDisplay.length > 0 ? revokerDisplay : @"***"];
-    [notice appendFormat:@"内容:%@", contentDisplay.length > 0 ? contentDisplay : @"（空）"];
+    [notice appendFormat:@"内容:%@%@", quote ? @" " : @"", contentDisplay.length > 0 ? contentDisplay : @"（空）"];
 
-    if (originType != 1) {
+    if (originType != 1 && !textReply) {
         [notice appendString:@"\n(非文字消息只做提醒)"];
     }
 
@@ -529,7 +532,10 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
 
     // 撤回文字只发包含原文的通知，避免额外转发一条原文。
     // 支持的非文字消息与 +1 共用原生转发链，另行发送撤回通知；排队不代表送达。
-    BOOL mediaSubmitted = !legacySend && (originType == 3 || originType == 43 || originType == 47 || originType == 49) &&
+    // 引用回复以完整文字通知保留上下文，原生转发可能只留下回复正文。
+    BOOL quotedReply = NO;
+    YMQuotedReplyText(originContent, originType, &quotedReply);
+    BOOL mediaSubmitted = !legacySend && !quotedReply && (originType == 3 || originType == 43 || originType == 47 || originType == 49) &&
                           YMForwardNativeToSession(outWrap, originType, selfId, YES);
     NSString *notice = YMBuildRevokeForwardNotice(sessionText ?: @"",
                                                   originType,

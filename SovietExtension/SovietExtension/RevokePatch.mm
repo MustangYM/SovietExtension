@@ -24,6 +24,7 @@
 #import "ForwardToSelfPatch.h"
 #import "MenuManager.h"
 #import "RevokeSettings.h"
+#import "QuotedReply.h"
 #import "SelfRevokeLedger.h"
 #import "SelfRevokePatch.h"
 #import "NSObject+MainHook.h"
@@ -699,7 +700,7 @@ static BOOL YMSafeReadUInt32(uintptr_t address, uint32_t *value) {
  读取微信内部 libc++ std::string 对象。
  这个函数只读，不析构，不接管所有权。
  */
-static NSString *YMNSStringFromLibcppStringObject(const void *stringObject) {
+static NSString *YMNSStringFromLibcppStringObject(const void *stringObject, size_t maxLength = 4095) {
     if (!stringObject) {
         return @"";
     }
@@ -717,29 +718,29 @@ static NSString *YMNSStringFromLibcppStringObject(const void *stringObject) {
 
     const char *data = NULL;
     size_t length = 0;
-    uint8_t stackBuffer[4096] = {0};
+    std::vector<uint8_t> buffer;
 
     if (flag >= 0) {
         length = (uint8_t)flag;
         if (length == 0 || length > 23) {
             return @"";
         }
-        memcpy(stackBuffer, header, length);
-        data = (const char *)stackBuffer;
+        data = (const char *)header;
     } else {
         uintptr_t remoteData = 0;
         memcpy(&remoteData, header, sizeof(remoteData));
         memcpy(&length, header + 8, sizeof(length));
 
-        if (remoteData == 0 || length == 0 || length >= sizeof(stackBuffer)) {
+        if (remoteData == 0 || length == 0 || length > maxLength) {
             return @"";
         }
 
-        if (!YMSafeReadMemory(remoteData, stackBuffer, length)) {
+        buffer.resize(length);
+        if (!YMSafeReadMemory(remoteData, buffer.data(), length)) {
             return @"";
         }
 
-        data = (const char *)stackBuffer;
+        data = (const char *)buffer.data();
     }
 
     NSString *value = [[NSString alloc] initWithBytes:data
@@ -1952,6 +1953,65 @@ NSString *YMQueryRoomName(NSString *roomID) {
         YMLog(@"[RoomNameQuery] session lookup failed");
         return @"";
     }
+}
+
+// Build 269079 原生缓存查询 0x1E55B00：Context -> 虚表 +0x38 Registry ->
+// 0x1E58634 ContactCache -> 0x39EFD50 shared_ptr<Contact>；+8 为 ID，+0x60 为备注。
+// shared_ptr/string 都是非平凡返回值（arm64 x8 sret），必须用真实 C++ 返回类型和 RAII。
+// ponytail: 只读微信已有缓存；未命中回退引用原名，避免 0x221D55C 的数据库/future 等待。
+static NSString *YMReadCachedContactRemark(NSString *contactID, const uintptr_t (&functions)[4]) {
+    if (!contactID.length || contactID.length > 128 ||
+        [contactID hasSuffix:@"@chatroom"] || [contactID hasSuffix:@"@im.chatroom"] ||
+        [contactID rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location != NSNotFound) return @"";
+    try {
+        const std::string query = YMStdStringFromNSString(contactID);
+        if (query.empty() || query.size() > 128) return @"";
+        using Shared = std::shared_ptr<void>;
+        using GetContext = Shared (*)();
+        using GetService = Shared (*)(void *);
+        using FindContact = Shared (*)(void *, const std::string *);
+        using GetRemark = std::string (*)(void *);
+        const auto context = reinterpret_cast<GetContext>(functions[0])();
+        if (!context) return @"";
+        uintptr_t vtable = 0, registryGetter = 0;
+        if (!YMSafeReadPointer(reinterpret_cast<uintptr_t>(context.get()), &vtable) || !vtable ||
+            !YMSafeReadPointer(vtable + 0x38, &registryGetter) || !registryGetter) return @"";
+        const auto registry = reinterpret_cast<GetService>(registryGetter)(context.get());
+        if (!registry) return @"";
+        const auto cache = reinterpret_cast<GetService>(functions[1])(registry.get());
+        if (!cache) return @"";
+        const auto contact = reinterpret_cast<FindContact>(functions[2])(cache.get(), &query);
+        if (!contact || ![YMNSStringFromLibcppStringObject(
+            reinterpret_cast<const uint8_t *>(contact.get()) + 8, 128) isEqualToString:contactID]) return @"";
+        const std::string remark = reinterpret_cast<GetRemark>(functions[3])(contact.get());
+        if (remark.empty() || remark.size() > 1024) return @"";
+        return [[NSString alloc] initWithBytes:remark.data() length:remark.size()
+                                     encoding:NSUTF8StringEncoding] ?: @"";
+    } catch (...) {
+        YMLog(@"[ContactRemark] cached lookup failed");
+        return @"";
+    }
+}
+
+NSString *YMQueryContactRemark(NSString *contactID) {
+    if (!YMWeChatDylibSlide || !YMMatchesWeChat269079Dylib()) return @"";
+    static const uintptr_t addresses[] = {0x428E5D4, 0x1E58634, 0x39EFD50, 0x47B8684};
+    static const uint8_t entries[4][16] = {
+        {0xff,0xc3,0x00,0xd1,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9,0xfd,0xc3,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9},
+        {0x00,0x80,0x01,0x91,0x64,0x24,0xfd,0x17,0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9}
+    };
+    uintptr_t functions[4] = {};
+    for (size_t i = 0; i < 4; ++i) {
+        functions[i] = YMRuntimeAddress(addresses[i]);
+        uint8_t current[16] = {};
+        if (!YMSafeReadMemory(functions[i], current, sizeof(current)) ||
+            memcmp(current, entries[i], sizeof(current)) != 0) return @"";
+    }
+    uintptr_t application = 0;
+    if (!YMSafeReadPointer(YMRuntimeAddress(0x9312568), &application) || !application) return @"";
+    return YMReadCachedContactRemark(contactID, functions);
 }
 
 // 需要主动预热昵称的群队列。
@@ -3882,7 +3942,7 @@ static BOOL YMFindRevokeContextAroundCallsite(uintptr_t originalSP,
     return NO;
 }
 
-// Pure presentation shared by native self notices and the existing others notice.
+// 本人与他人的撤回提示共用格式化；引用人名称可读取本地联系人备注。
 static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
                                                 NSString *originRawContent,
                                                 uint64_t originCreateTimeMs,
@@ -3892,11 +3952,13 @@ static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
                                                 BOOL preserveContent) {
     NSString *sender = @"";
     NSString *cleanContent = @"";
-    BOOL shouldShowContent = YMRevokeMessageTypeShouldShowContent(originType);
+    BOOL textReply = NO;
+    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply);
+    BOOL shouldShowContent = quote != nil || YMRevokeMessageTypeShouldShowContent(originType);
 
     if (shouldShowContent) {
-        cleanContent = preserveContent ? (originRawContent ?: @"") : YMCleanOriginMessageContent(originRawContent, &sender);
-        if (!preserveContent && YMRevokeOriginTextLooksUseless(cleanContent)) {
+        cleanContent = quote ?: (preserveContent ? (originRawContent ?: @"") : YMCleanOriginMessageContent(originRawContent, &sender));
+        if (!quote && !preserveContent && YMRevokeOriginTextLooksUseless(cleanContent)) {
             shouldShowContent = NO;
             cleanContent = @"";
             sender = @"";
@@ -3907,7 +3969,7 @@ static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
 
     NSMutableString *notice = [NSMutableString string];
     [notice appendString:@"⚠️苏维埃已拦截撤回消息⚠️\n"];
-    [notice appendFormat:@"%@\n", YMRevokeMessageTypeName(originType)];
+    [notice appendFormat:@"%@\n", YMRevokeMessageTypeName(textReply ? 1 : originType)];
 
     if (shouldShowContent) {
         if (cleanContent.length > 0) {
@@ -3994,8 +4056,7 @@ NSString *YMBuildSelfRevokeNotice(uintptr_t originalWrap, uintptr_t revokeExt) {
     if (!account.length) return nil;
     // This is the live original Wrap held by the revoke coroutine. Reuse the
     // native string reader so long messages still produce the existing 1200-char summary.
-    NSString *content = YMRevokeMessageTypeShouldShowContent(type) ?
-        YMNSStringFromStdString((const std::string *)(originalWrap + 0x130)) : @"";
+    NSString *content = YMNSStringFromLibcppStringObject((const void *)(originalWrap + 0x130), 262144);
     if (!content) return nil;
     NSString *replaceMsg = revokeExt ? YMNSStringFromLibcppStringObject((const void *)(revokeExt + 0x170)) : @"";
     NSString *displayName = YMDisplayNameFromRevokeReplaceMsg(replaceMsg);
@@ -4139,7 +4200,7 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
             originType = originType264 != 0 ? originType264 : originType12;
         }
 
-        NSString *originContent = YMNSStringFromLibcppStringObject((const void *)(outWrap + 304));
+        NSString *originContent = YMNSStringFromLibcppStringObject((const void *)(outWrap + 304), 262144);
         NSString *originMsgSource = YMNSStringFromLibcppStringObject((const void *)(outWrap + 352));
         NSString *originContentLog = YMRevokeMessageTypeShouldShowContent(originType) ? YMRevokeShortLogText(originContent) : @"<非文本，不展开>";
         NSString *originMsgSourceLog = YMRevokeShortLogText(originMsgSource);
