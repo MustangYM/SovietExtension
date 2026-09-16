@@ -11,10 +11,39 @@
 #import "RevokePatch.h"
 #import "MistyModeSettingsWindowController.h"
 #import "RevokeSettings.h"
+#import <objc/runtime.h>
 
 #ifndef kExitChatroomNickname
 #define kExitChatroomNickname @"YMExitChatroomNickname"
 #endif
+
+static NSMenuItem *YMAssistantMenuItem;
+static NSMenu *YMHostHelpMenu;
+static NSMenu *YMHostWindowsMenu;
+
+// 269079 在启动延迟回调中按末尾两项指定窗口/帮助；仅纠正助手插入造成的误指定。
+static void YMProtectAssistantMenuRole(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *name in @[@"setHelpMenu:", @"setWindowsMenu:"]) {
+            SEL selector = NSSelectorFromString(name);
+            Method method = class_getInstanceMethod(NSApplication.class, selector);
+            void (*original)(id, SEL, NSMenu *) = (void (*)(id, SEL, NSMenu *))method_getImplementation(method);
+            BOOL help = [name isEqualToString:@"setHelpMenu:"];
+            IMP replacement = imp_implementationWithBlock(^(NSApplication *app, NSMenu *menu) {
+                if (app == NSApp && YMAssistantMenuItem &&
+                    app.mainMenu.itemArray.lastObject == YMAssistantMenuItem) {
+                    if (help && menu == YMAssistantMenuItem.submenu) menu = YMHostHelpMenu;
+                    else if (!help && YMHostWindowsMenu && menu == YMHostHelpMenu &&
+                             app.mainMenu.numberOfItems >= 3 &&
+                             [app.mainMenu itemAtIndex:app.mainMenu.numberOfItems - 2].submenu == menu) menu = YMHostWindowsMenu;
+                }
+                original(app, selector, menu);
+            });
+            method_setImplementation(method, replacement);
+        }
+    });
+}
 
 @interface MenuManager ()
 @property (nonatomic, strong) NSMenuItem *ym_mistyModeMenuItem;
@@ -138,7 +167,19 @@
     menuItem.enabled = YES;
     menuItem.submenu = subMenu;
     
-    [[[NSApplication sharedApplication] mainMenu] addItem:menuItem];
+    NSApplication *application = NSApplication.sharedApplication;
+    NSMenu *mainMenu = application.mainMenu;
+    if (!mainMenu) return;
+    if (YMAssistantMenuItem.menu == mainMenu) [mainMenu removeItem:YMAssistantMenuItem];
+    YMHostHelpMenu = mainMenu.itemArray.lastObject.submenu ?: [[NSMenu alloc] initWithTitle:@""];
+    YMHostWindowsMenu = mainMenu.numberOfItems >= 2 ? [mainMenu itemAtIndex:mainMenu.numberOfItems - 2].submenu : nil;
+    YMAssistantMenuItem = menuItem;
+    YMProtectAssistantMenuRole();
+    if (!application.helpMenu) {
+        // helpMenu 为空时 AppKit 会自选菜单插入搜索；离屏菜单可关闭此行为。
+        application.helpMenu = [[NSMenu alloc] initWithTitle:@""];
+    }
+    [mainMenu addItem:menuItem];
 }
 
 #pragma mark - Menu Actions
