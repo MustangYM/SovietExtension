@@ -212,11 +212,6 @@ static void YMProtectAssistantMenuRole(void) {
 
 - (void)onAntiRevoke:(NSMenuItem *)item
 {
-    if (![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
-        [self ym_confirmToggleMenuItem:item userDefaultsKey:kAntiRevoke
-                       informativeText:@"重启微信生效"];
-        return;
-    }
     [self ym_confirmToggleMenuItem:item userDefaultsKey:kAntiRevoke informativeText:nil];
 }
 
@@ -346,15 +341,6 @@ static void YMProtectAssistantMenuRole(void) {
                  informativeText:(NSString *)informativeText
 {
     BOOL enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:key];
-    if (informativeText.length > 0) {
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = @"更改设置";
-        alert.informativeText = [informativeText stringByAppendingString:@"\n保存后下次启动微信生效，不会立即重启。关闭拦截不会自动开启微信的自动更新。"];
-        [alert addButtonWithTitle:@"取消"];
-        [alert addButtonWithTitle:@"保存"];
-        if ([alert runModal] != NSAlertSecondButtonReturn) return;
-    }
-
     YMFeatureApplyResult result = YMApplyFeatureSetting(key, enabled);
     if (result == YMFeatureUnavailable) {
         NSAlert *alert = [[NSAlert alloc] init];
@@ -364,18 +350,20 @@ static void YMProtectAssistantMenuRole(void) {
         [alert runModal];
         return;
     }
-    [self ym_setMenuItem:item enabled:enabled userDefaultsKey:key];
-    NSString *pendingSuffix = @"（待重启）";
-    if ([item.title hasSuffix:pendingSuffix]) item.title = [item.title substringToIndex:item.title.length - pendingSuffix.length];
-    if (result == YMFeatureNeedsRestart) item.title = [item.title stringByAppendingString:pendingSuffix];
-    item.toolTip = result == YMFeatureNeedsRestart ? @"已保存，下次启动微信生效" : nil;
-    if (result == YMFeatureNeedsRestart && informativeText.length == 0) {
+    if (result == YMFeatureNeedsRestart) {
         NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = @"设置已保存";
-        alert.informativeText = @"当前微信版本的此项配置需下次启动生效，请在方便时手动重启微信。";
-        [alert addButtonWithTitle:@"知道了"];
-        [alert runModal];
+        alert.messageText = @"此设置需要重启微信";
+        NSString *message = @"立即重启后生效；取消则保持原设置。";
+        if (informativeText.length > 0) {
+            message = [informativeText stringByAppendingFormat:@"\n%@\n关闭拦截不会自动开启微信的自动更新。", message];
+        }
+        alert.informativeText = message;
+        [alert addButtonWithTitle:@"取消"];
+        [alert addButtonWithTitle:@"立即重启"];
+        if ([alert runModal] != NSAlertSecondButtonReturn) return;
     }
+    [self ym_setMenuItem:item enabled:enabled userDefaultsKey:key];
+    if (result == YMFeatureNeedsRestart) [self ym_restartWeChatAfterDelay:0.1];
 }
 
 - (void)ym_setMenuItem:(NSMenuItem *)item
@@ -400,12 +388,6 @@ static void YMProtectAssistantMenuRole(void) {
                 if (![group containsObject:sibling.representedObject]) continue;
                 BOOL selected = [defaults boolForKey:sibling.representedObject];
                 sibling.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
-                // 同组联动也要刷新生效提示，避免取消后残留“待重启”。
-                BOOL pending = YMApplyFeatureSetting(sibling.representedObject, selected) == YMFeatureNeedsRestart;
-                NSString *suffix = @"（待重启）";
-                if ([sibling.title hasSuffix:suffix]) sibling.title = [sibling.title substringToIndex:sibling.title.length - suffix.length];
-                if (pending) sibling.title = [sibling.title stringByAppendingString:suffix];
-                sibling.toolTip = pending ? @"已保存，下次启动微信生效" : nil;
             }
             break;
         }

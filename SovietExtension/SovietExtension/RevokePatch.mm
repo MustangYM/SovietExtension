@@ -5330,12 +5330,12 @@ static void YMLoadFeatureSwitchesFromDefaults(void) {
 YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled) {
     if (![NSThread isMainThread]) return YMFeatureUnavailable;
     if ([key isEqualToString:kAntiUpdate]) return enabled == YMFeatureAntiUpdateEnabled ? YMFeatureApplied : YMFeatureNeedsRestart;
-    if ([key isEqualToString:kAutoLogin] || [key isEqualToString:kRevokeForwardToSelfRealSend]) {
+    if ([key isEqualToString:kAutoLogin] || [key isEqualToString:kRevokeForwardToSelfRealSend] ||
+        [key isEqualToString:kRevokeForwardOthers] || [key isEqualToString:kRevokeForwardSelf]) {
         return YMFeatureApplied;
     }
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
     if ([key isEqualToString:kRevokeEnabled] || [key isEqualToString:kSelfAntiRevoke] ||
-        [key isEqualToString:kRevokeForwardOthers] || [key isEqualToString:kRevokeForwardSelf] ||
         ([key isEqualToString:kAntiRevoke] && profile && strcmp(profile->buildVersion, "269079") == 0)) {
         // 本人适配的 Hook 启动时安装，开关只控制后续事件，不从菜单写代码页。
         if (!profile || strcmp(profile->buildVersion, "269079") != 0) return YMFeatureUnavailable;
