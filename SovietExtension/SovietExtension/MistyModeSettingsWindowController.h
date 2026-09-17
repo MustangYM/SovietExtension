@@ -26,7 +26,7 @@ static NSString *kThemeMistyColorfulAnimationDuration = @"kThemeMistyColorfulAni
 /// MenuManager 只负责打开这个窗口，具体 UI、读写配置、立即应用效果都在这里处理。
 @interface MistyModeSettingsWindowController : NSWindowController
 
-/// 点击「确定」并保存成功后回调，MenuManager 用它来给菜单打勾。
+/// 加载或更改设置后回调，MenuManager 用它同步主题菜单勾选。
 @property (nonatomic, copy, nullable) void (^confirmHandler)(BOOL isOpen);
 
 + (void)registerDefaults;
