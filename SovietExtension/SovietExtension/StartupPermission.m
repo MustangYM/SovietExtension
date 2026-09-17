@@ -36,19 +36,28 @@ static int SOVEXTDataAccessError(void);
         self.reopening = YES;
         self.buttons.firstObject.enabled = NO;
         [self.window orderOut:nil];
-        NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
-        configuration.createsNewApplicationInstance = YES;
-        [NSWorkspace.sharedWorkspace openApplicationAtURL:NSBundle.mainBundle.bundleURL
-            configuration:configuration completionHandler:^(NSRunningApplication *app, NSError *error) {
-                if (app && !error) _exit(0);
-                [[NSRunLoop mainRunLoop] performInModes:@[NSModalPanelRunLoopMode] block:^{
-                    self.reopening = NO;
-                    self.buttons.firstObject.enabled = YES;
-                    self.messageText = @"微信未能打开，请重试";
-                    [NSApp activate];
-                    [self.window makeKeyAndOrderFront:nil];
-                }];
-            }];
+        // A normal launch must wait for this early AppKit guide to leave.
+        // Forcing a second instance while it is alive can split the Dock identity.
+        NSTask *relauncher = [[NSTask alloc] init];
+        relauncher.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
+        NSString *script = @"attempt=0; while kill -0 \"$1\" 2>/dev/null; do "
+            "attempt=$((attempt + 1)); [ \"$attempt\" -lt 300 ] || exit 1; "
+            "/bin/sleep 0.1; done; /usr/bin/open \"$2\" || "
+            "/usr/bin/logger -t SovietExtension 'Permission recovery: reopen failed; open WeChat manually'";
+        relauncher.arguments = @[@"-c", script,
+            @"sovext-permission-relaunch", [NSString stringWithFormat:@"%d", getpid()],
+            NSBundle.mainBundle.bundlePath];
+        relauncher.standardInput = NSFileHandle.fileHandleWithNullDevice;
+        relauncher.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+        relauncher.standardError = NSFileHandle.fileHandleWithNullDevice;
+        NSError *error = nil;
+        if ([relauncher launchAndReturnError:&error]) _exit(0);
+        os_log_error(OS_LOG_DEFAULT, "SOVEXT_STARTUP_PERMISSION: relaunch failed: %{public}@", error);
+        self.reopening = NO;
+        self.buttons.firstObject.enabled = YES;
+        self.messageText = @"微信未能打开，请重试";
+        [NSApp activate];
+        [self.window makeKeyAndOrderFront:nil];
         return;
     }
     // Modal ordering must not keep this guide above another app's settings window.
