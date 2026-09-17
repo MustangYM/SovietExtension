@@ -4262,6 +4262,11 @@ extern "C" void YMRevokeOriginCallsiteHelper(uintptr_t originalSP, uintptr_t sav
             return;
         }
 
+        // 与原生撤回入口一致：系统消息已不是可撤回的原消息，不能归入他人策略。
+        uint32_t messageType = 0;
+        if (supportedSelf && (!YMSafeReadMemory(outWrap + 0x0C, &messageType, sizeof(messageType)) ||
+                              messageType == 10000)) return;
+
         // 账号尚不可用时不把未知身份归到他人策略。
         NSString *account = supportedSelf ? YMSelfRevokeAccount() : nil;
         if (supportedSelf && !account.length) return;
