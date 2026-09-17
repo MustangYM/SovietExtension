@@ -37,6 +37,7 @@
 #include <memory>
 #include <cstddef>
 #include <mutex>
+#include "GroupExitSubscription.h"
 
 #pragma mark - 全局状态
 
@@ -2806,18 +2807,21 @@ static BOOL YMGroupExitInsertLocalSystemNotice(NSString *roomID,
     return YES;
 }
 
-static void YMGroupExitFlushPendingNotices(const char *source) {
+static void YMGroupExitFlushPendingNotices(const char *source, const std::function<bool()> &current = {}) {
     if (YMGroupExitFlushingPending.exchange(true)) {
         return;
     }
 
+    YMGroupExitAtomicBoolResetGuard flushGuard(&YMGroupExitFlushingPending);
     @autoreleasepool {
         std::unique_lock<std::recursive_mutex> stateLock(YMGroupExitStateMutex());
+        if (current && !current()) {
+            return;
+        }
         uint64_t generation = YMGroupExitGeneration.load();
         NSArray<NSDictionary<NSString *, id> *> *items = YMGroupExitDrainPendingNotices(20);
         stateLock.unlock();
         if (items.count == 0) {
-            YMGroupExitFlushingPending.store(false);
             return;
         }
 
@@ -2836,13 +2840,263 @@ static void YMGroupExitFlushPendingNotices(const char *source) {
                   memberID ?: @"",
                   noticeText ?: @"");
 
+            if (current && !current()) break;
             YMGroupExitInsertLocalSystemNotice(roomID,
                                                noticeText,
                                                source ?: "unknown");
         }
     }
 
-    YMGroupExitFlushingPending.store(false);
+}
+
+
+#pragma mark - 269079 原生成员变更订阅（不修改代码页）
+
+namespace GX = YMGroupExitNativeABI;
+using YMGroupExitShared = std::shared_ptr<void>;
+using YMGroupExitGetter = YMGroupExitShared (*)(void *);
+static const GX::SourceLocation YMGroupExitLocation = {"GroupExitMonitor", "RevokePatch.mm", __LINE__, 0, nullptr};
+
+static BOOL YMGroupExitUsesSubscription(void) {
+    const auto *profile = YMGetActiveProfile();
+    return profile && strcmp(profile->buildVersion, "269079") == 0;
+}
+
+static BOOL YMGroupExitSubscriptionReady(void) {
+    if (!YMGroupExitUsesSubscription() || !YMMatchesWeChat269079Dylib()) return NO;
+    static const struct { uintptr_t address; uint8_t bytes[16]; } entries[] = {
+        {0x179DD8, {0xff,0x03,0x03,0xd1,0xf8,0x5f,0x08,0xa9,0xf6,0x57,0x09,0xa9,0xf4,0x4f,0x0a,0xa9}},
+        {0x5B78D0, {0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
+        {0x17A070, {0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9,0xfd,0x43,0x00,0x91,0x13,0x10,0x40,0xf9}},
+        {0x30760, {0x28,0x00,0x80,0x52,0x08,0x00,0x00,0xb9,0x01,0x88,0x00,0xa9,0x08,0x00,0x00,0x90}},
+        {0x3084C, {0x08,0x00,0x40,0xf9,0xe8,0x01,0x00,0xb4,0x09,0x00,0x80,0x12,0x09,0x01,0xe9,0xb8}},
+        {0x4713AC0, {0xff,0x43,0x01,0xd1,0xf8,0x5f,0x01,0xa9,0xf6,0x57,0x02,0xa9,0xf4,0x4f,0x03,0xa9}},
+        {0x428D0BC, {0x28,0x84,0x02,0xb0,0x00,0xb5,0x42,0xf9,0xc0,0x03,0x5f,0xd6,0xff,0xc3,0x00,0xd1}},
+        {0x3A58B24, {0xff,0xc3,0x07,0xd1,0xfa,0x67,0x1a,0xa9,0xf8,0x5f,0x1b,0xa9,0xf6,0x57,0x1c,0xa9}},
+        {0x428E5D4, {0xff,0xc3,0x00,0xd1,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
+        {0x13AAE84, {0x0a,0xa4,0x42,0xa9,0x0a,0x25,0x00,0xa9,0x89,0x00,0x00,0xb4,0x28,0x21,0x00,0x91}},
+        {0x1E1D580, {0xff,0xc3,0x01,0xd1,0xf4,0x4f,0x05,0xa9,0xfd,0x7b,0x06,0xa9,0xfd,0x83,0x01,0x91}},
+        {0x21414F0, {0xfc,0x6f,0xba,0xa9,0xfa,0x67,0x01,0xa9,0xf8,0x5f,0x02,0xa9,0xf6,0x57,0x03,0xa9}},
+        {0x428E6A0, {0x0a,0x48,0x41,0xf9,0x09,0x4c,0x41,0xf9,0x0a,0x25,0x00,0xa9,0x89,0x00,0x00,0xb4}},
+        {0x3A280F0, {0xff,0xc3,0x06,0xd1,0xfc,0x6f,0x16,0xa9,0xf8,0x5f,0x17,0xa9,0xf6,0x57,0x18,0xa9}},
+        {0x597BE88, {0xff,0x83,0x06,0xd1,0xf6,0x57,0x17,0xa9,0xf4,0x4f,0x18,0xa9,0xfd,0x7b,0x19,0xa9}},
+        {0x597C66C, {0x08,0x0c,0x05,0x91,0x08,0xfd,0xdf,0x08,0x00,0x01,0x00,0x12,0xc0,0x03,0x5f,0xd6}},
+        {0x3934FCC, {0xfc,0x6f,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
+    };
+    for (const auto &entry : entries) {
+        uint8_t bytes[16];
+        if (!YMSafeReadMemory(YMRuntimeAddress(entry.address), bytes, sizeof(bytes)) ||
+            memcmp(bytes, entry.bytes, sizeof(bytes))) return NO;
+    }
+    return YES;
+}
+
+static GX::Calls YMGroupExitSubscriptionCalls(void) {
+    return {(GX::Subscribe)YMRuntimeAddress(0x179DD8), (GX::Cancel)YMRuntimeAddress(0x5B78D0),
+            (GX::ReleaseToken)YMRuntimeAddress(0x17A070)};
+}
+
+static bool YMGroupExitPost(std::function<void()> work) {
+    uintptr_t runner = 0, environment = 0;
+    if (!YMSafeReadPointer(YMRuntimeAddress(0x93B02B0), &runner) || !runner ||
+        !YMSafeReadPointer(YMRuntimeAddress(0x93B02D8), &environment) || !environment) return false;
+    const GX::SchedulerCalls calls = {(GX::InitClosure)YMRuntimeAddress(0x30760),
+        (GX::ReleaseClosure)YMRuntimeAddress(0x3084C), (GX::PostRawRunner)YMRuntimeAddress(0x4713AC0)};
+    return GX::enqueue(calls, (void *)runner, (void *)environment, YMGroupExitLocation, std::move(work));
+}
+
+struct YMGroupExitAccount {
+    YMGroupExitShared context;
+    std::string id;
+    explicit operator bool() const { return context && !id.empty(); }
+    bool operator==(const YMGroupExitAccount &other) const { return context == other.context && id == other.id; }
+};
+static YMGroupExitAccount YMGroupExitCurrentAccount(void) {
+    uintptr_t app = 0;
+    if (!YMSafeReadPointer(YMRuntimeAddress(0x9312568), &app) || !app) return {};
+    auto context = ((YMGroupExitGetter)(*(uintptr_t **)app)[0x68 / 8])((void *)app);
+    if (!context || !(((uintptr_t (*)(void *))(*(uintptr_t **)app)[0x70 / 8])((void *)app) & 1)) return {};
+    auto value = ((const std::string *(*)(void *))(*(uintptr_t **)app)[0x28 / 8])((void *)app);
+    NSString *account = YMNSStringFromLibcppStringObject(value, 128);
+    if (!account.length) return {};
+    return {context, YMStdStringFromNSString(account)};
+}
+
+struct YMGroupExitSubscription {
+    GX::Token token;
+    YMGroupExitAccount account;
+    YMGroupExitShared service;
+    uint64_t generation;
+    std::atomic_bool active{true};
+    // pending 只由发布 runner 访问；原子标记允许查询完成/超时解锁下一批。
+    std::set<std::string> pending;
+    std::atomic_bool querying{false};
+    std::weak_ptr<void> task; // runner 持有弱句柄，避免 task -> work -> state 环。
+    YMGroupExitSubscription(YMGroupExitAccount value, uint64_t epoch) : account(std::move(value)), generation(epoch) {}
+    YMGroupExitSubscription(const YMGroupExitSubscription &) = delete;
+    YMGroupExitSubscription &operator=(const YMGroupExitSubscription &) = delete;
+};
+static std::shared_ptr<YMGroupExitSubscription> &YMGroupExitSubscriptionState(void) {
+    static std::shared_ptr<YMGroupExitSubscription> state;
+    return state;
+}
+static bool YMGroupExitSubscriptionCurrent(const std::shared_ptr<YMGroupExitSubscription> &state) {
+    return state && state->active.load() && YMIsGroupExitMonitorEnabled() &&
+        state->generation == YMGroupExitGeneration.load() && state->account == YMGroupExitCurrentAccount();
+}
+
+static NSSet<NSString *> *YMGroupExitValidatedMembers(NSString *room,
+        const std::vector<YMGroupExitChatroomMemberUIData> &members, bool success) {
+    if (!success || members.empty() || members.size() > 20000) return nil;
+    NSMutableSet<NSString *> *ids = [NSMutableSet setWithCapacity:members.size()];
+    for (const auto &member : members) {
+        if (member.memberID.empty() || member.memberID.size() > 128 || member.memberID.find('\0') != std::string::npos) return nil;
+        NSString *id = [[NSString alloc] initWithBytes:member.memberID.data() length:member.memberID.size() encoding:NSUTF8StringEncoding];
+        if (!YMGroupExitMemberIDLooksUseful(id, room) || [ids containsObject:id]) return nil;
+        [ids addObject:id];
+    }
+    return ids;
+}
+
+static void YMGroupExitQueryNext(const std::shared_ptr<YMGroupExitSubscription> &state) {
+    if (state->querying || state->pending.empty() || !YMGroupExitSubscriptionCurrent(state)) return;
+    std::string room = *state->pending.begin();
+    state->pending.erase(state->pending.begin());
+    state->querying = true;
+    try {
+        auto finished = std::make_shared<std::atomic_bool>(false);
+        auto members = std::make_shared<std::vector<YMGroupExitChatroomMemberUIData>>();
+        std::function<void()> work = [state, room, members, finished] {
+            @autoreleasepool {
+                bool success = false;
+                try {
+                    if (YMGroupExitSubscriptionCurrent(state) && !finished->load()) {
+                        auto context = ((YMGroupExitShared (*)())YMRuntimeAddress(0x428E5D4))();
+                        auto registry = context ? ((YMGroupExitGetter)YMRuntimeAddress(0x13AAE84))(context.get()) : YMGroupExitShared{};
+                        auto manager = registry ? ((YMGroupExitGetter)YMRuntimeAddress(0x1E1D580))(registry.get()) : YMGroupExitShared{};
+                        if (manager) success = ((YMGroupExitMemberDataListFunc)YMRuntimeAddress(0x21414F0))(
+                            (int64_t)manager.get(), (int64_t *)&room, (int64_t *)members.get()) == 1;
+                    }
+                } catch (...) { /* 查询失败保留旧基线。 */ }
+                try {
+                    if (!finished->load()) {
+                        NSString *roomID = [[NSString alloc] initWithBytes:room.data() length:room.size() encoding:NSUTF8StringEncoding];
+                        NSSet *snapshot = YMGroupExitValidatedMembers(roomID, *members, success);
+                        {
+                            std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
+                            if (snapshot && !finished->load() && YMGroupExitSubscriptionCurrent(state)) {
+                                YMGroupExitCacheMemberDataListFromOutVector(roomID, (int64_t *)members.get(), "native subscription");
+                                YMGroupExitHandleDBApplySnapshot(roomID, snapshot);
+                            }
+                        }
+                        // 原生插入也会等待 future，必须留在协程内；不跨等待持有状态锁。
+                        if (!finished->load() && YMGroupExitSubscriptionCurrent(state))
+                            YMGroupExitFlushPendingNotices("native subscription", [state, finished] {
+                                return !finished->load() && YMGroupExitSubscriptionCurrent(state);
+                            });
+                    }
+                } catch (...) { YMLog(@"[GroupExitMonitor] native notice task cancelled or failed"); }
+                if (finished->exchange(true)) return;
+                state->querying.store(false);
+                YMGroupExitPost([state] { YMGroupExitQueryNext(state); });
+            }
+        };
+        void *app = ((void *(*)())YMRuntimeAddress(0x428D0BC))();
+        auto scheduler = app ? ((YMGroupExitGetter)YMRuntimeAddress(0x428E6A0))(app) : YMGroupExitShared{};
+        auto task = scheduler ? ((YMGroupExitShared (*)(void *, const GX::SourceLocation *, std::function<void()> *, int))
+            YMRuntimeAddress(0x3A280F0))(scheduler.get(), &YMGroupExitLocation, &work, 1) : YMGroupExitShared{};
+        if (!task || *(uintptr_t *)task.get() != YMRuntimeAddress(0x8EB9550) ||
+            ((bool (*)(void *))YMRuntimeAddress(0x597C66C))(task.get())) {
+            finished->store(true);
+            state->querying = false;
+            YMLog(@"[GroupExitMonitor] native member query could not start");
+            return;
+        }
+        state->task = task;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (finished->exchange(true)) return;
+            state->querying.store(false);
+            try { ((void (*)(void *))YMRuntimeAddress(0x597BE88))(task.get()); } catch (...) {}
+            YMGroupExitPost([state] { YMGroupExitQueryNext(state); });
+        });
+    } catch (...) {
+        state->querying.store(false);
+        state->pending.insert(room);
+        YMLog(@"[GroupExitMonitor] native query scheduling failed; will retry");
+    }
+}
+
+static void YMGroupExitRefreshSubscription(void) {
+    @autoreleasepool { try {
+        auto &state = YMGroupExitSubscriptionState();
+        auto account = YMGroupExitCurrentAccount();
+        if (state && (!YMGroupExitSubscriptionCurrent(state) || !(state->account == account))) {
+            state->active.store(false);
+            if (auto task = state->task.lock()) {
+                try { ((void (*)(void *))YMRuntimeAddress(0x597BE88))(task.get()); } catch (...) {}
+            }
+            GX::cancelAndRelease(YMGroupExitSubscriptionCalls(), state->token);
+            state.reset();
+            std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
+            YMGroupExitClearRuntimeState("native subscription account/setting changed");
+        }
+        if (!YMIsGroupExitMonitorEnabled() || !account) return;
+        if (state) {
+            // 旧协程尚未退出 flush 时保留的新通知，下一生命周期检查补发。
+            if (state->pending.empty() && !state->querying.load()) {
+                std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
+                NSString *room = YMGroupExitPendingNotices().firstObject[@"roomID"];
+                if (room.length) state->pending.insert(YMStdStringFromNSString(room));
+            }
+            YMGroupExitQueryNext(state);
+            return;
+        }
+        auto registry = ((YMGroupExitGetter)(*(uintptr_t **)account.context.get())[0x30 / 8])(account.context.get());
+        uintptr_t descriptor = YMRuntimeAddress(0x8B61660);
+        auto service = registry ? ((YMGroupExitShared (*)(void *, const uintptr_t *))YMRuntimeAddress(0x3A58B24))(
+            registry.get(), &descriptor) : YMGroupExitShared{};
+        if (!service) return;
+        uintptr_t subject = 0, vtable = 0;
+        if (!YMSafeReadPointer((uintptr_t)service.get() + 0x1B0, &subject) || !subject ||
+            !YMSafeReadPointer(subject, &vtable) || vtable != YMRuntimeAddress(0x8B61C48)) return;
+        auto next = std::make_shared<YMGroupExitSubscription>(account, YMGroupExitGeneration.load());
+        next->service = service;
+        std::weak_ptr<YMGroupExitSubscription> weak = next;
+        next->token = GX::start(YMGroupExitSubscriptionCalls(), service.get(), [weak](const std::string &room) {
+            @autoreleasepool { try {
+                auto state = weak.lock();
+                if (!YMGroupExitSubscriptionCurrent(state) || room.empty() || room.size() > 128 ||
+                    room.find('\0') != std::string::npos) return;
+                NSString *id = [[NSString alloc] initWithBytes:room.data() length:room.size() encoding:NSUTF8StringEncoding];
+                if (![id hasSuffix:@"@chatroom"]) return;
+                if (state->pending.size() >= 512 && !state->pending.count(room)) return;
+                state->pending.insert(room);
+                YMGroupExitQueryNext(state);
+            } catch (...) { YMLog(@"[GroupExitMonitor] native member event failed"); } }
+        }, YMGroupExitLocation);
+        if (!next->token.cancelOwner) {
+            GX::cancelAndRelease(YMGroupExitSubscriptionCalls(), next->token);
+            return;
+        }
+        state = next;
+        YMLog(@"[GroupExitMonitor] native member subscription active");
+    } catch (...) { YMLog(@"[GroupExitMonitor] native subscription unavailable; retry after login"); } }
+}
+
+static BOOL YMGroupExitStartSubscription(void) {
+    if (!YMGroupExitSubscriptionReady()) return NO;
+    // ponytail: 2 秒仅检查登录/订阅生命周期，不轮询群成员；登录事件适配后可替换此定时器。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static dispatch_source_t timer;
+        if (!timer) {
+            timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 4);
+            dispatch_source_set_event_handler(timer, ^{ YMGroupExitPost([] { YMGroupExitRefreshSubscription(); }); });
+            dispatch_resume(timer);
+        }
+        YMGroupExitPost([] { YMGroupExitRefreshSubscription(); });
+    });
+    return YES;
 }
 
 static void YMGroupExitBuildAbsoluteJump(uintptr_t targetAddress, uint8_t patch[16]) {
@@ -3510,6 +3764,10 @@ static BOOL YMPatchGroupExitSingleFunction(uintptr_t targetAddress,
 }
 
 static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
+    if (YMGroupExitUsesSubscription()) {
+        YMRecordWeChatDylibSlide(slide, source);
+        return YMGroupExitStartSubscription();
+    }
     if (YMHasPatchedGroupExitMonitor) {
         YMLog(@"[GroupExitMonitor] already patched, skip. source=%@", source);
         return YES;
@@ -5361,7 +5619,9 @@ YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled) {
         BOOL monitor = monitorKey ? enabled : YMFeatureGroupExitMonitorEnabled.load();
         BOOL nickname = nicknameKey ? enabled : YMFeatureGroupExitNicknameEnabled.load();
         if (enabled && (!profile || !YMGroupExitProfileReady(profile))) return YMFeatureUnavailable;
-        if (monitorKey && enabled && !YMHasPatchedGroupExitMonitor) return YMFeatureNeedsRestart;
+        const BOOL nativeSubscription = YMGroupExitUsesSubscription();
+        if (monitorKey && enabled && nativeSubscription && !YMGroupExitStartSubscription()) return YMFeatureUnavailable;
+        if (monitorKey && enabled && !nativeSubscription && !YMHasPatchedGroupExitMonitor) return YMFeatureNeedsRestart;
         std::lock_guard<std::recursive_mutex> stateLock(YMGroupExitStateMutex());
         BOOL monitorChanged = monitor != YMFeatureGroupExitMonitorEnabled.load();
         YMFeatureGroupExitMonitorEnabled.store(monitor);
@@ -5370,6 +5630,8 @@ YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled) {
             YMGroupExitGeneration.fetch_add(1);
             YMGroupExitNicknameGeneration.fetch_add(1);
             YMGroupExitClearRuntimeState("menu setting");
+            if (nativeSubscription && YMGroupExitSubscriptionReady())
+                YMGroupExitPost([] { YMGroupExitRefreshSubscription(); });
         }
         return YMFeatureApplied;
     }
