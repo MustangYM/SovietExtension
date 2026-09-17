@@ -35,6 +35,7 @@
 #include <time.h>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <cstddef>
 #include <mutex>
 #include "GroupExitSubscription.h"
@@ -1279,13 +1280,13 @@ static NSString *YMBuildAntiRevokeNoticeText(NSString *remoteUserOrSession,
                                              NSString *revokeSession,
                                              NSString *msgID,
                                              NSString *newMsgID) {
-    NSString *displayName = YMDisplayNameFromRevokeReplaceMsg(replaceMsg);
     NSString *session = revokeSession.length > 0 ? revokeSession : (remoteUserOrSession ?: @"");
+    NSString *displayName = YMResolveMemberDisplayName(revokerWxid, session, YMDisplayNameFromRevokeReplaceMsg(replaceMsg), nil);
 
     NSMutableString *text = [NSMutableString string];
     [text appendString:@"⚠️苏维埃已拦截撤回消息⚠️\n"];
 
-    if (displayName.length > 0 && revokerWxid.length > 0) {
+    if (displayName.length > 0 && revokerWxid.length > 0 && ![displayName isEqualToString:revokerWxid]) {
         [text appendFormat:@"%@（%@）\n", displayName, revokerWxid];
     } else if (displayName.length > 0) {
         [text appendFormat:@"%@\n", displayName];
@@ -1959,63 +1960,111 @@ NSString *YMQueryRoomName(NSString *roomID) {
     }
 }
 
-// Build 269079 原生缓存查询 0x1E55B00：Context -> 虚表 +0x38 Registry ->
-// 0x1E58634 ContactCache -> 0x39EFD50 shared_ptr<Contact>；+8 为 ID，+0x60 为备注。
-// shared_ptr/string 都是非平凡返回值（arm64 x8 sret），必须用真实 C++ 返回类型和 RAII。
-// ponytail: 只读微信已有缓存；未命中回退引用原名，避免 0x221D55C 的数据库/future 等待。
-static NSString *YMReadCachedContactRemark(NSString *contactID, const uintptr_t (&functions)[4]) {
-    if (!contactID.length || contactID.length > 128 ||
-        [contactID hasSuffix:@"@chatroom"] || [contactID hasSuffix:@"@im.chatroom"] ||
-        [contactID rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location != NSNotFound) return @"";
-    try {
-        const std::string query = YMStdStringFromNSString(contactID);
-        if (query.empty() || query.size() > 128) return @"";
-        using Shared = std::shared_ptr<void>;
-        using GetContext = Shared (*)();
-        using GetService = Shared (*)(void *);
-        using FindContact = Shared (*)(void *, const std::string *);
-        using GetRemark = std::string (*)(void *);
-        const auto context = reinterpret_cast<GetContext>(functions[0])();
-        if (!context) return @"";
-        uintptr_t vtable = 0, registryGetter = 0;
-        if (!YMSafeReadPointer(reinterpret_cast<uintptr_t>(context.get()), &vtable) || !vtable ||
-            !YMSafeReadPointer(vtable + 0x38, &registryGetter) || !registryGetter) return @"";
-        const auto registry = reinterpret_cast<GetService>(registryGetter)(context.get());
-        if (!registry) return @"";
-        const auto cache = reinterpret_cast<GetService>(functions[1])(registry.get());
-        if (!cache) return @"";
-        const auto contact = reinterpret_cast<FindContact>(functions[2])(cache.get(), &query);
-        if (!contact || ![YMNSStringFromLibcppStringObject(
-            reinterpret_cast<const uint8_t *>(contact.get()) + 8, 128) isEqualToString:contactID]) return @"";
-        const std::string remark = reinterpret_cast<GetRemark>(functions[3])(contact.get());
-        if (remark.empty() || remark.size() > 1024) return @"";
-        return [[NSString alloc] initWithBytes:remark.data() length:remark.size()
-                                     encoding:NSUTF8StringEncoding] ?: @"";
-    } catch (...) {
-        YMLog(@"[ContactRemark] cached lookup failed");
-        return @"";
-    }
+// Build 269079：仅查原生联系人/群缓存，不调用数据库或等待 future。
+// 所有 shared_ptr/optional/string 均以真实 C++ 类型承接 arm64 x8 返回值。
+static BOOL YMGroupExitDisplayNameLooksUseful(NSString *, NSString *);
+static NSString *YMGroupExitTrimDisplayName(NSString *);
+static BOOL YMMemberNameIDIsValid(NSString *value, BOOL room) {
+    BOOL isRoom = [value hasSuffix:@"@chatroom"] || [value hasSuffix:@"@im.chatroom"];
+    return value.length && value.length <= 128 && isRoom == room &&
+        [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 128 &&
+        [value rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location == NSNotFound;
 }
 
-NSString *YMQueryContactRemark(NSString *contactID) {
+static NSString *YMReadRoomMemberNickname(void *registry, NSString *roomID, NSString *memberID,
+                                         const uintptr_t (&functions)[6]) {
+    if (!YMMemberNameIDIsValid(roomID, YES)) return @"";
+    using Shared = std::shared_ptr<void>;
+    using Optional = std::optional<Shared>;
+    static_assert(sizeof(Optional) == 24 && alignof(Optional) == 8, "WeChat room optional ABI");
+    const std::string cacheName = "ChatroomCache", query = YMStdStringFromNSString(roomID);
+    auto cache = reinterpret_cast<Shared (*)(void *, const std::string *)>(functions[4])(registry, &cacheName);
+    if (!cache) return @"";
+    auto room = reinterpret_cast<Optional (*)(void *, const std::string *)>(functions[5])(
+        static_cast<uint8_t *>(cache.get()) + 0x30, &query);
+    if (!room || !*room) return @"";
+    uintptr_t object = reinterpret_cast<uintptr_t>(room->get()), list = 0;
+    int32_t count = 0;
+    if (![YMNSStringFromLibcppStringObject((void *)(object + 8), 128) isEqualToString:roomID] ||
+        !YMSafeReadMemory(object + 0x60, &count, sizeof(count)) || count < 0 || count > 20000 ||
+        !YMSafeReadPointer(object + 0x58, &list) || !list) return @"";
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t member = 0, id = 0, name = 0;
+        if (!YMSafeReadPointer(list + size_t(i) * 8, &member) || !member ||
+            !YMSafeReadPointer(member + 8, &id) || !id) return @"";
+        if (![YMNSStringFromLibcppStringObject((void *)id, 128) isEqualToString:memberID]) continue;
+        if (!YMSafeReadPointer(member + 0x10, &name) || !name) return @"";
+        return YMNSStringFromLibcppStringObject((void *)name, 1024);
+    }
+    return @"";
+}
+
+static NSString *YMReadCachedMemberName(NSString *memberID, NSString *roomID, NSString *capturedGroupName,
+                                        const uintptr_t (&functions)[6]) {
+    using Shared = std::shared_ptr<void>;
+    using GetService = Shared (*)(void *);
+    auto context = reinterpret_cast<Shared (*)()>(functions[0])();
+    if (!context) return @"";
+    uintptr_t vtable = 0, getter = 0;
+    if (!YMSafeReadPointer(reinterpret_cast<uintptr_t>(context.get()), &vtable) || !vtable ||
+        !YMSafeReadPointer(vtable + 0x38, &getter) || !getter) return @"";
+    auto registry = reinterpret_cast<GetService>(getter)(context.get());
+    if (!registry) return @"";
+    auto cache = reinterpret_cast<GetService>(functions[1])(registry.get());
+    const std::string query = YMStdStringFromNSString(memberID);
+    auto contact = cache ? reinterpret_cast<Shared (*)(void *, const std::string *)>(functions[2])(cache.get(), &query) : Shared{};
+    if (contact && ![YMNSStringFromLibcppStringObject(static_cast<uint8_t *>(contact.get()) + 8, 128)
+                    isEqualToString:memberID]) contact.reset();
+    if (contact) {
+        const auto remark = reinterpret_cast<std::string (*)(void *)>(functions[3])(contact.get());
+        NSString *name = remark.size() <= 1024 ? [[NSString alloc] initWithBytes:remark.data()
+            length:remark.size() encoding:NSUTF8StringEncoding] : nil;
+        if (YMGroupExitDisplayNameLooksUseful(name, memberID)) return name;
+    }
+    NSString *groupName = YMReadRoomMemberNickname(registry.get(), roomID, memberID, functions);
+    if (YMGroupExitDisplayNameLooksUseful(groupName, memberID)) return groupName;
+    if (YMMemberNameIDIsValid(roomID, YES) && YMGroupExitDisplayNameLooksUseful(capturedGroupName, memberID)) return capturedGroupName;
+    return contact ? YMNSStringFromLibcppStringObject(static_cast<uint8_t *>(contact.get()) + 0xA8, 1024) : @"";
+}
+
+static NSString *YMQueryCachedMemberName(NSString *memberID, NSString *roomID, NSString *capturedGroupName) {
     if (!YMWeChatDylibSlide || !YMMatchesWeChat269079Dylib()) return @"";
-    static const uintptr_t addresses[] = {0x428E5D4, 0x1E58634, 0x39EFD50, 0x47B8684};
-    static const uint8_t entries[4][16] = {
+    static const uintptr_t addresses[] = {0x428E5D4, 0x1E58634, 0x39EFD50, 0x47B8684, 0x39F34B8, 0x2167A5C};
+    static const uint8_t entries[6][16] = {
         {0xff,0xc3,0x00,0xd1,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
         {0xff,0x03,0x01,0xd1,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9,0xfd,0xc3,0x00,0x91},
         {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9},
-        {0x00,0x80,0x01,0x91,0x64,0x24,0xfd,0x17,0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9}
+        {0x00,0x80,0x01,0x91,0x64,0x24,0xfd,0x17,0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9},
+        {0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91},
+        {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9}
     };
-    uintptr_t functions[4] = {};
-    for (size_t i = 0; i < 4; ++i) {
+    uintptr_t functions[6] = {};
+    for (size_t i = 0; i < 6; ++i) {
         functions[i] = YMRuntimeAddress(addresses[i]);
-        uint8_t current[16] = {};
-        if (!YMSafeReadMemory(functions[i], current, sizeof(current)) ||
-            memcmp(current, entries[i], sizeof(current)) != 0) return @"";
+        uint8_t bytes[16];
+        if (!YMSafeReadMemory(functions[i], bytes, sizeof(bytes)) || memcmp(bytes, entries[i], sizeof(bytes))) return @"";
     }
-    uintptr_t application = 0;
-    if (!YMSafeReadPointer(YMRuntimeAddress(0x9312568), &application) || !application) return @"";
-    return YMReadCachedContactRemark(contactID, functions);
+    static const uint8_t nicknameRead[16] = {0xe9,0x5f,0x40,0xf9,0xa9,0x00,0x00,0xb4,0x21,0xa1,0x02,0x91,0xe0,0x03,0x13,0xaa};
+    uint8_t bytes[16];
+    uintptr_t app = 0;
+    if (!YMSafeReadMemory(YMRuntimeAddress(0x22320D8), bytes, 16) || memcmp(bytes, nicknameRead, 16) ||
+        !YMSafeReadPointer(YMRuntimeAddress(0x9312568), &app) || !app) return @"";
+    return YMReadCachedMemberName(memberID, roomID, capturedGroupName, functions);
+}
+
+NSString *YMResolveMemberDisplayName(NSString *memberID, NSString *roomID, NSString *sourceName, NSString *capturedGroupName) {
+    // ponytail: only native caches; missing entries retain the message's own name, then its ID.
+    NSString *name = @"";
+    BOOL validID = YMMemberNameIDIsValid(memberID, NO);
+    if (validID) {
+        try { name = YMQueryCachedMemberName(memberID, roomID, capturedGroupName); }
+        catch (...) { name = @""; }
+    }
+    if (YMGroupExitDisplayNameLooksUseful(name, memberID)) return YMGroupExitTrimDisplayName(name);
+    if (validID && YMMemberNameIDIsValid(roomID, YES) && YMGroupExitDisplayNameLooksUseful(capturedGroupName, memberID))
+        return YMGroupExitTrimDisplayName(capturedGroupName);
+    if (YMGroupExitDisplayNameLooksUseful(sourceName, memberID)) return YMGroupExitTrimDisplayName(sourceName);
+    return validID ? memberID : @"";
 }
 
 // 需要主动预热昵称的群队列。
@@ -2186,7 +2235,6 @@ static void YMGroupExitCacheDisplayName(NSString *roomID,
     @synchronized (cache) {
         NSString *oldName = cache[roomKey];
         cache[roomKey] = name;
-        cache[memberID] = name;
 
         if (cache.count > 4096) {
             NSArray<NSString *> *allKeys = [cache allKeys];
@@ -2221,10 +2269,6 @@ static NSString *YMGroupExitCachedDisplayName(NSString *roomID, NSString *member
             }
         }
 
-        NSString *globalName = cache[memberID];
-        if (YMGroupExitDisplayNameLooksUseful(globalName, memberID)) {
-            return globalName;
-        }
     }
 
     return @"";
@@ -2233,12 +2277,10 @@ static NSString *YMGroupExitCachedDisplayName(NSString *roomID, NSString *member
 static NSString *YMGroupExitDisplayNameForMemberID(NSString *memberID, NSString *roomID) {
     NSString *displayName = @"";
     if (YMIsGroupExitNicknameEnabled()) {
-        displayName = YMGroupExitTrimDisplayName(YMQueryContactRemark(memberID));
-        if (!YMGroupExitDisplayNameLooksUseful(displayName, memberID)) {
-            displayName = YMGroupExitCachedDisplayName(roomID, memberID);
-        }
+        NSString *groupName = YMGroupExitCachedDisplayName(roomID, memberID);
+        displayName = YMResolveMemberDisplayName(memberID, roomID, nil, groupName);
     }
-    if (displayName.length > 0) {
+    if (displayName.length > 0 && ![displayName isEqualToString:memberID]) {
         if (memberID.length > 0) {
             return [NSString stringWithFormat:@"%@（%@）", displayName, memberID];
         }
@@ -4018,11 +4060,12 @@ static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
                                                 uint32_t originCreateTimeSec,
                                                 NSString *revokerWxid,
                                                 NSString *revokerDisplayName,
-                                                BOOL preserveContent) {
+                                                BOOL preserveContent, NSString *sessionID = nil) {
+    revokerDisplayName = YMResolveMemberDisplayName(revokerWxid, sessionID, revokerDisplayName, nil);
     NSString *sender = @"";
     NSString *cleanContent = @"";
     BOOL textReply = NO;
-    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply);
+    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply, sessionID);
     BOOL shouldShowContent = quote != nil || YMRevokeMessageTypeShouldShowContent(originType);
 
     if (shouldShowContent) {
@@ -4052,7 +4095,7 @@ static NSString *YMBuildDetailedAntiRevokeNotice(uint32_t originType,
         }
     }
 
-    if (revokerDisplayName.length > 0 && revokerWxid.length > 0) {
+    if (revokerDisplayName.length > 0 && revokerWxid.length > 0 && ![revokerDisplayName isEqualToString:revokerWxid]) {
         [notice appendFormat:@"%@（%@）\n", revokerDisplayName, revokerWxid];
     } else if (revokerDisplayName.length > 0) {
         [notice appendFormat:@"%@\n", revokerDisplayName];
@@ -4094,7 +4137,7 @@ static BOOL YMInsertDetailedAntiRevokeNoticeFromOrigin(std::string *sessionStrin
     }
 
     NSString *notice = YMBuildDetailedAntiRevokeNotice(originType, originRawContent,
-        originCreateTimeMs, originCreateTimeSec, revokerWxid, revokerDisplayName, NO);
+        originCreateTimeMs, originCreateTimeSec, revokerWxid, revokerDisplayName, NO, sessionText);
 
     std::string content = YMStdStringFromNSString(notice);
 
@@ -4131,7 +4174,7 @@ NSString *YMBuildSelfRevokeNotice(uintptr_t originalWrap, uintptr_t revokeExt) {
     NSString *displayName = YMDisplayNameFromRevokeReplaceMsg(replaceMsg);
     if (!displayName.length) displayName = @"你";
     return YMBuildDetailedAntiRevokeNotice(type, content, createTimeMs, createTimeSec,
-                                          account, displayName, YES);
+                                          account, displayName, YES, YMSelfRevokeSession(originalWrap));
 }
 
 NSString *YMSelfRevokeWrapIdentity(uintptr_t wrap) {

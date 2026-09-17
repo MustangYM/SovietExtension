@@ -249,13 +249,13 @@ static NSString *YMBuildRevokeForwardNotice(NSString *sessionText,
     }
 
     BOOL textReply = NO;
-    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply);
+    NSString *quote = YMQuotedReplyText(originRawContent, originType, &textReply, sessionText);
     if (clean.length > 1600) {
         clean = [[clean substringToIndex:1600] stringByAppendingString:@"…"];
     }
 
     NSString *contentDisplay = quote ?: YMForwardContentDisplay(originType, clean);
-    NSString *revokerDisplay = YMForwardRevokerDisplay(revokerDisplayName, revokerWxid, sender);
+    NSString *revokerDisplay = YMForwardRevokerDisplay(YMResolveMemberDisplayName(revokerWxid, sessionText, revokerDisplayName, nil), revokerWxid, sender);
 
     NSMutableString *notice = [NSMutableString string];
     [notice appendString:@"--拦截到一条撤回消息--\n"];

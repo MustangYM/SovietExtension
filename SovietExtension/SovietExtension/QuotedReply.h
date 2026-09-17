@@ -1,7 +1,7 @@
 #pragma once
 #import <Foundation/Foundation.h>
 
-NSString *YMQueryContactRemark(NSString *contactID);
+#import "RevokePatch.h"
 
 static inline NSXMLElement *YMQuoteXMLRoot(NSString *raw) {
     if (!raw.length || raw.length > 262144) return nil;
@@ -32,7 +32,7 @@ static inline NSString *YMQuoteTypeLabel(NSString *type, NSString *content) {
 }
 
 // 正文和引用各自按自身类型展示，只读取直接字段，不将引用 XML 当成正文。
-static inline NSString *YMQuotedReplyText(NSString *raw, uint32_t originType = 49, BOOL *textReply = nullptr) {
+static inline NSString *YMQuotedReplyText(NSString *raw, uint32_t originType = 49, BOOL *textReply = nullptr, NSString *sessionID = nil) {
     if (textReply) *textReply = NO;
     if (originType != 3 && originType != 34 && originType != 43 && originType != 47 &&
         originType != 48 && originType != 49) return nil;
@@ -57,8 +57,9 @@ static inline NSString *YMQuotedReplyText(NSString *raw, uint32_t originType = 4
     NSString *contactID = fromRoom ? chat : (chatRoom || !chat.length ? from : chat);
     if ((fromRoom && chatRoom) || (!fromRoom && !chatRoom && from.length && chat.length &&
         ![from isEqualToString:chat])) contactID = nil;
-    NSString *remark = contactID.length ? YMQueryContactRemark(contactID) : nil;
-    if (remark.length) name = remark;
+    // 优先引用自身群 ID；无群字段时使用当前会话，身份歧义时保留引用原名。
+    NSString *roomID = fromRoom ? from : (chatRoom ? chat : sessionID);
+    if (contactID.length) name = YMResolveMemberDisplayName(contactID, roomID, name, nil);
     NSString *content = [[reference elementsForName:@"content"].firstObject stringValue] ?: @"";
     NSString *type = [[reference elementsForName:@"type"].firstObject stringValue];
     // 非文字引用不输出原始 XML、路径或媒体元数据。

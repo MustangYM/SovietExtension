@@ -28,4 +28,9 @@ typedef NS_ENUM(NSInteger, YMFeatureApplyResult) {
 // 主线程调用；成功后由菜单保存。失败不更改功能开关。
 FOUNDATION_EXPORT YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled);
 
+// 备注 → 当前群昵称 → 微信昵称；缓存缺失保留消息原名，最后回退成员 ID。
+// capturedGroupName 仅用于退群前同群快照，调用方负责账号/群隔离。
+NSString *YMResolveMemberDisplayName(NSString * _Nullable memberID, NSString * _Nullable roomID,
+                                     NSString * _Nullable sourceName, NSString * _Nullable capturedGroupName);
+
 NS_ASSUME_NONNULL_END
