@@ -2865,6 +2865,9 @@ static BOOL YMGroupExitUsesSubscription(void) {
 static BOOL YMGroupExitSubscriptionReady(void) {
     if (!YMGroupExitUsesSubscription() || !YMMatchesWeChat269079Dylib()) return NO;
     static const struct { uintptr_t address; uint8_t bytes[16]; } entries[] = {
+        {0x39DC16C, {0xff,0xc3,0x02,0xd1,0xfa,0x67,0x06,0xa9,0xf8,0x5f,0x07,0xa9,0xf6,0x57,0x08,0xa9}},
+        {0x3A13614, {0x00,0xc0,0x00,0x91,0x8d,0x06,0x00,0x14,0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9}},
+        {0x3A1504C, {0xff,0x03,0x01,0xd1,0xf6,0x57,0x01,0xa9,0xf4,0x4f,0x02,0xa9,0xfd,0x7b,0x03,0xa9}},
         {0x179DD8, {0xff,0x03,0x03,0xd1,0xf8,0x5f,0x08,0xa9,0xf6,0x57,0x09,0xa9,0xf4,0x4f,0x0a,0xa9}},
         {0x5B78D0, {0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9,0xfd,0x83,0x00,0x91}},
         {0x17A070, {0xf4,0x4f,0xbe,0xa9,0xfd,0x7b,0x01,0xa9,0xfd,0x43,0x00,0x91,0x13,0x10,0x40,0xf9}},
@@ -2930,6 +2933,7 @@ struct YMGroupExitSubscription {
     std::atomic_bool active{true};
     // pending 只由发布 runner 访问；原子标记允许查询完成/超时解锁下一批。
     std::set<std::string> pending;
+    unsigned baselineScans = 0;
     std::atomic_bool querying{false};
     std::weak_ptr<void> task; // runner 持有弱句柄，避免 task -> work -> state 环。
     YMGroupExitSubscription(YMGroupExitAccount value, uint64_t epoch) : account(std::move(value)), generation(epoch) {}
@@ -3026,6 +3030,30 @@ static void YMGroupExitQueryNext(const std::shared_ptr<YMGroupExitSubscription> 
     }
 }
 
+// 原生 0x3864E08 也用此缓存枚举；0x218 布局复用群名查询的 YMRoomSessionData。
+// 开启时预读已有群，不能等退群事件才建立第一份名单。
+static void YMGroupExitPrimeKnownRooms(const std::shared_ptr<YMGroupExitSubscription> &state) {
+    if (state->baselineScans >= 5 || !YMGroupExitSubscriptionCurrent(state)) return;
+    ++state->baselineScans; // 登录缓存可能尚在加载，最多随生命周期检查补读五次。
+    auto registry = ((YMGroupExitGetter)(*(uintptr_t **)state->account.context.get())[0x38 / 8])(state->account.context.get());
+    uintptr_t descriptor = YMRuntimeAddress(0x8CDF548);
+    auto cache = registry ? ((YMGroupExitShared (*)(void *, const uintptr_t *))YMRuntimeAddress(0x39DC16C))(
+        registry.get(), &descriptor) : YMGroupExitShared{};
+    if (!cache || *(uintptr_t *)cache.get() != YMRuntimeAddress(0x8DA3008)) return;
+    auto sessions = ((std::vector<YMRoomSessionData> (*)(void *))YMRuntimeAddress(0x3A13614))(cache.get());
+    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
+    if (!YMGroupExitSubscriptionCurrent(state)) return;
+    for (const auto &session : sessions) {
+        const auto &room = session.roomID;
+        if (room.empty() || room.size() > 128 || room.find('\0') != std::string::npos) continue;
+        NSString *id = [[NSString alloc] initWithBytes:room.data() length:room.size() encoding:NSUTF8StringEncoding];
+        if (![id hasSuffix:@"@chatroom"] || YMGroupExitMemberCache()[id].count) continue;
+        if (state->pending.size() >= 512) break;
+        state->pending.insert(room);
+    }
+    YMLog(@"[GroupExitMonitor] baseline rooms queued=%lu scan=%u", (unsigned long)state->pending.size(), state->baselineScans);
+}
+
 static void YMGroupExitRefreshSubscription(void) {
     @autoreleasepool { try {
         auto &state = YMGroupExitSubscriptionState();
@@ -3042,6 +3070,7 @@ static void YMGroupExitRefreshSubscription(void) {
         }
         if (!YMIsGroupExitMonitorEnabled() || !account) return;
         if (state) {
+            YMGroupExitPrimeKnownRooms(state);
             // 旧协程尚未退出 flush 时保留的新通知，下一生命周期检查补发。
             if (state->pending.empty() && !state->querying.load()) {
                 std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
@@ -3080,6 +3109,8 @@ static void YMGroupExitRefreshSubscription(void) {
         }
         state = next;
         YMLog(@"[GroupExitMonitor] native member subscription active");
+        YMGroupExitPrimeKnownRooms(state);
+        YMGroupExitQueryNext(state);
     } catch (...) { YMLog(@"[GroupExitMonitor] native subscription unavailable; retry after login"); } }
 }
 
