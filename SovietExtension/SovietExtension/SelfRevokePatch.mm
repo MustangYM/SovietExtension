@@ -407,8 +407,8 @@ extern "C" uintptr_t YMSelfResultEmpty;
 uintptr_t YMSelfResultEmpty = 0;
 extern "C" uintptr_t YMSelfResultAfter;
 uintptr_t YMSelfResultAfter = 0;
-extern "C" uintptr_t YMSelfResultZero;
-uintptr_t YMSelfResultZero = 0;
+extern "C" uintptr_t YMSelfResultCopyNative;
+uintptr_t YMSelfResultCopyNative = 0;
 extern "C" uintptr_t YMSelfCanaryPointer;
 uintptr_t YMSelfCanaryPointer = 0;
 extern "C" uintptr_t YMSelfEndAfter;
@@ -594,16 +594,13 @@ __asm__(
     "br x16\n"
     "1:\n"
     "YMSelfRestore\n"
-    "ldr w8, [sp, #0x6DC]\n"
-    "cbz w8, 2f\n"
     "add x1, sp, #0x5E8\n"
     "mov x0, x19\n"
     "adrp x16, _YMSelfResultAfter@PAGE\n"
     "ldr x16, [x16, _YMSelfResultAfter@PAGEOFF]\n"
-    "br x16\n"
-    "2:\n"
-    "adrp x16, _YMSelfResultZero@PAGE\n"
-    "ldr x16, [x16, _YMSelfResultZero@PAGEOFF]\n"
+    "mov x30, x16\n"
+    "adrp x16, _YMSelfResultCopyNative@PAGE\n"
+    "ldr x16, [x16, _YMSelfResultCopyNative@PAGEOFF]\n"
     "br x16\n"
 );
 extern "C" void YMSelfEndStub(void);
@@ -710,10 +707,11 @@ __asm__(
 namespace {
 struct Fingerprint { uintptr_t address; uint8_t bytes[16]; };
 // Exact Build269079 instructions, including native callees and continuation paths.
+// Result copying has native inbound branches at +0x2BBC920; keep that as the patch entry.
 const Fingerprint fingerprints[] = {
     {0x2BBBE44, {0xe0, 0x6b, 0x41, 0xf9, 0xe1, 0x63, 0x00, 0x91, 0x02, 0x00, 0x80, 0x52, 0xf0, 0x7d, 0xf2, 0x97}},
     {0x2BBBF04, {0xa0, 0x03, 0x53, 0xf8, 0xe8, 0x43, 0x0b, 0x91, 0xe1, 0xa3, 0x17, 0x91, 0xd0, 0x44, 0xf3, 0x97}},
-    {0x2BBC918, {0xe8, 0xdf, 0x46, 0xb9, 0xc8, 0x02, 0x00, 0x34, 0xe1, 0xa3, 0x17, 0x91, 0xe0, 0x03, 0x13, 0xaa}},
+    {0x2BBC920, {0xe1, 0xa3, 0x17, 0x91, 0xe0, 0x03, 0x13, 0xaa, 0x5c, 0x01, 0xd7, 0x97, 0x28, 0x00, 0x80, 0x52}},
     {0x2BBAC58, {0xa8, 0x83, 0x5b, 0xf8, 0xa9, 0xf8, 0x02, 0x90, 0x29, 0xe5, 0x45, 0xf9, 0x29, 0x01, 0x40, 0xf9}},
     {0x2BBF534, {0x93, 0x7e, 0x40, 0xf9, 0xfc, 0x8b, 0x41, 0xf9, 0xe8, 0x8f, 0x41, 0xf9, 0x9f, 0x03, 0x08, 0xeb}},
     {0x2BBF6D8, {0xe0, 0x03, 0x14, 0xaa, 0x05, 0x35, 0x72, 0x94, 0x81, 0x7e, 0x40, 0xf9, 0xe8, 0xc3, 0x00, 0x91}},
@@ -778,11 +776,25 @@ bool writeCode(uintptr_t address, const void *bytes) {
 }
 bool applyPatches(uintptr_t base, const uintptr_t *hooks, size_t count,
                   bool (*writer)(uintptr_t, const void *) = writeCode) {
+    // Keep the native result-move return instruction and its unwind callsite intact.
+    const int64_t resultPages = (int64_t)(hooks[2] >> 12) -
+                                (int64_t)((base + fingerprints[2].address) >> 12);
+    if (resultPages < -(INT64_C(1) << 20) || resultPages >= (INT64_C(1) << 20)) return false;
     for (size_t i = 0; i < count; ++i) {
         uint8_t patch[16];
         const uint32_t instructions[2] = {0x58000050, 0xD61F0200};
         memcpy(patch, instructions, 8);
         memcpy(patch + 8, &hooks[i], 8);
+        if (i == 2) {
+            const uint32_t pageBits = (uint32_t)resultPages & 0x1FFFFF;
+            const uint32_t entry[3] = {
+                0x90000010u | ((pageBits & 3) << 29) | ((pageBits >> 2) << 5),
+                0x91000210u | ((uint32_t)(hooks[i] & 0xFFF) << 10),
+                0xD61F0200u
+            };
+            memcpy(patch, entry, sizeof(entry));
+            memcpy(patch + 12, fingerprints[i].bytes + 12, 4);
+        }
         if (!writer(base + fingerprints[i].address, patch)) {
             bool rolledBack = true;
             for (size_t n = i + 1; n > 0; --n)
@@ -818,8 +830,8 @@ bool YMInstallSelfRevokePatch(void) {
     YMSelfReplaceAfter = base + 0x2BBBF14;
     YMSelfReplaceNative = base + 0x288D250;
     YMSelfResultEmpty = base + 0x2BBC934;
-    YMSelfResultAfter = base + 0x2BBC928;
-    YMSelfResultZero = base + 0x2BBC974;
+    YMSelfResultAfter = base + 0x2BBC92C;
+    YMSelfResultCopyNative = base + 0x217CE98;
     YMSelfCanaryPointer = base + 0x8ACEBC8;
     YMSelfEndAfter = base + 0x2BBAC68;
     YMSelfQueryAfter = base + 0x2BBF544;
