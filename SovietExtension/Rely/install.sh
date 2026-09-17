@@ -16,7 +16,9 @@ APP_NAME="WeChat"
 FRAMEWORK_NAME="${FRAMEWORK_NAME:-SovietExtension}"
 APP_PATH="/Applications/${APP_NAME}.app"
 FORCE=0
+WRITE_INSTALL_STATE=1
 RUN_SUDO=0
+PLUGIN_SRC_PATH=""
 
 # Runtime vars
 APP_SHORT_VERSION=""
@@ -62,8 +64,10 @@ Usage:
 
 Options:
   --force              Ignore version check and install anyway / 忽略版本检查，强制安装
+  --no-install-state   Skip writing install state / 不写安装记录
   --app=PATH           Specify WeChat.app path / 指定 WeChat.app 路径
   --framework=NAME     Specify framework name, default: SovietExtension / 指定插件名，默认 SovietExtension
+  --plugin=PATH        Install this built framework / 指定实际构建的 framework
   --insert-dylib=PATH  Specify insert_dylib path / 指定 insert_dylib 路径
   -h, --help           Show help / 显示帮助
 
@@ -89,11 +93,17 @@ for arg in "$@"; do
         --force)
             FORCE=1
             ;;
+        --no-install-state)
+            WRITE_INSTALL_STATE=0
+            ;;
         --app=*)
             APP_PATH="${arg#--app=}"
             ;;
         --framework=*)
             FRAMEWORK_NAME="${arg#--framework=}"
+            ;;
+        --plugin=*)
+            PLUGIN_SRC_PATH="${arg#--plugin=}"
             ;;
         --insert-dylib=*)
             INSERT_DYLIB_PATH="${arg#--insert-dylib=}"
@@ -115,7 +125,7 @@ MACOS_PATH="${APP_PATH}/Contents/MacOS"
 INFO_PLIST="${APP_PATH}/Contents/Info.plist"
 APP_EXECUTABLE_PATH="${MACOS_PATH}/${APP_NAME}"
 
-PLUGIN_SRC_PATH="${SCRIPT_DIR}/Plugin/${FRAMEWORK_NAME}.framework"
+PLUGIN_SRC_PATH="${PLUGIN_SRC_PATH:-${SCRIPT_DIR}/Plugin/${FRAMEWORK_NAME}.framework}"
 PLUGIN_SRC_BINARY_PATH="${PLUGIN_SRC_PATH}/${FRAMEWORK_NAME}"
 FRAMEWORK_DST_PATH="${MACOS_PATH}/${FRAMEWORK_NAME}.framework"
 FRAMEWORK_DST_BINARY_PATH="${FRAMEWORK_DST_PATH}/${FRAMEWORK_NAME}"
@@ -286,6 +296,17 @@ check_basic_files() {
     [ -f "${PLUGIN_SRC_BINARY_PATH}" ] || die "Framework binary not found / framework 内找不到同名二进制: ${PLUGIN_SRC_BINARY_PATH}"
 
     [ -f "${SUPPORTED_FILE}" ] || die "supported_versions.txt not found / 找不到版本控制文件: ${SUPPORTED_FILE}"
+
+    # Resolve symlinks before copy_framework can remove the destination.
+    local source_dir destination_dir
+    source_dir="$(cd "${PLUGIN_SRC_PATH}" && pwd -P)"
+    destination_dir="$(cd "${MACOS_PATH}" && pwd -P)/${FRAMEWORK_NAME}.framework"
+    if [ -d "${FRAMEWORK_DST_PATH}" ]; then
+        destination_dir="$(cd "${FRAMEWORK_DST_PATH}" && pwd -P)"
+    fi
+    case "${source_dir}/" in
+        "${destination_dir}/"*) die "Plugin source overlaps destination / 插件源不能位于安装目标内" ;;
+    esac
 
     ok "Files look good / 文件检查通过"
 }
@@ -532,8 +553,10 @@ is_executable_injected() {
 
     [ -f "${executable}" ] || return 1
 
-    otool -l "${executable}" 2>/dev/null | grep -q "${LOAD_DYLIB_PATH}" && return 0
-    otool -l "${executable}" 2>/dev/null | grep -q "${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" && return 0
+    # pipefail 下 grep -q 提前退出可能使 otool 收到 SIGPIPE，导致已注入被误判为未注入。
+    # 读完整段输出并丢弃匹配文本，保留 otool 真正失败时的非零状态。
+    otool -l "${executable}" 2>/dev/null | grep "${LOAD_DYLIB_PATH}" >/dev/null && return 0
+    otool -l "${executable}" 2>/dev/null | grep "${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" >/dev/null && return 0
 
     return 1
 }
@@ -551,6 +574,18 @@ backup_executable() {
     fi
 
     if is_executable_injected "${APP_EXECUTABLE_PATH}"; then
+        # Older Xcode installs used this name. Reuse only a clean copy of this binary.
+        local legacy_backup="${APP_EXECUTABLE_PATH}_backup"
+        local current_uuids="" legacy_uuids=""
+        if [ -f "${legacy_backup}" ] && ! is_executable_injected "${legacy_backup}"; then
+            current_uuids="$(otool -l "${APP_EXECUTABLE_PATH}" | awk '$1 == "uuid" {print $2}' | sort)" || current_uuids=""
+            legacy_uuids="$(otool -l "${legacy_backup}" | awk '$1 == "uuid" {print $2}' | sort)" || legacy_uuids=""
+            if [ -n "${current_uuids}" ] && [ "${current_uuids}" = "${legacy_uuids}" ]; then
+                run_cmd cp -p "${legacy_backup}" "${BACKUP_PATH}"
+                ok "Migrated clean Xcode backup / 已迁移匹配当前程序的干净 Xcode 备份"
+                return 0
+            fi
+        fi
         die "WeChat executable is already injected, but clean backup is missing / 当前微信主程序已被注入，但没有干净备份。请先重新安装微信或恢复原版"
     fi
 
@@ -698,9 +733,34 @@ verify_install() {
     if codesign -vvv --deep --strict "${APP_PATH}" >/dev/null 2>&1; then
         ok "Code signature verified / 签名验证通过"
     else
-        warn "Code signature verification failed, but app may still run for debugging / 签名验证未完全通过，但调试运行不一定受影响"
-        echo "    Debug command / 调试命令："
-        echo "      codesign -vvv --deep --strict \"${APP_PATH}\""
+        die "Code signature verification failed / 签名验证失败，未清除权限"
+    fi
+}
+
+reset_app_data_permission() {
+    # Only the installed WeChat's container permission; never reset All or FDA.
+    if [ "$(read_plist CFBundleIdentifier)" != "com.tencent.xinWeChat" ]; then
+        warn "Not the standard WeChat bundle / 非标准微信标识，未清除数据访问权限"
+        return 0
+    fi
+
+    local output=""
+    local result=0
+    if [ "${EUID}" -eq 0 ]; then
+        if [ -z "${SUDO_USER:-}" ] || [ "${SUDO_USER}" = "root" ]; then
+            warn "No installing user / 无法确定安装用户，未清除数据访问旧授权"
+            return 0
+        fi
+        output="$(sudo -u "${SUDO_USER}" /usr/bin/tccutil reset SystemPolicyAppDataDetailed com.tencent.xinWeChat 2>&1)" || result=$?
+    else
+        output="$(/usr/bin/tccutil reset SystemPolicyAppDataDetailed com.tencent.xinWeChat 2>&1)" || result=$?
+    fi
+    if [ "${result}" -eq 0 ]; then
+        ok "微信数据访问旧授权已清除；请打开微信重新授权"
+    else
+        # This service is accepted on macOS 27; do not broaden the reset on older systems.
+        warn "微信已安装，但数据访问旧授权未清除；请在系统设置中手动处理"
+        echo "    ${output}"
     fi
 }
 
@@ -755,7 +815,10 @@ backup_executable
 restore_clean_executable
 copy_framework
 insert_framework
-write_state_file
+if [ "${WRITE_INSTALL_STATE}" -eq 1 ]; then
+    write_state_file
+fi
 sign_app
 verify_install
+reset_app_data_permission
 print_done

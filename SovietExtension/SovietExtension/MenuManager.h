@@ -13,6 +13,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 static NSString *kAntiUpdate = @"kAntiUpdate.SOVIET";
 static NSString *kAntiRevoke = @"kAntiRevoke.SOVIET";
+static NSString *kRevokeEnabled = @"kRevokeEnabled.SOVIET";
+static NSString *kRevokeForwardOthers = @"kRevokeForwardOthers.SOVIET";
+static NSString *kRevokeForwardSelf = @"kRevokeForwardSelf.SOVIET";
+static NSString *kSelfAntiRevoke = @"kSelfAntiRevoke.SOVIET";
 static NSString *kExitChatroom = @"kExitChatroom.SOVIET";
 static NSString *kRevokeForwardToSelfRealSend = @"kRevokeForwardToSelfRealSend.SOVIET";
 static NSString *kExitChatroomNick = @"kExitChatroomNick.SOVIET";

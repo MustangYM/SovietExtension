@@ -32,6 +32,8 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
 
 
 @interface MistyModeSettingsWindowController ()
+@property (nonatomic, strong) NSButton *themeToggleButton;
+@property (nonatomic, strong) NSTextField *themeStatusLabel;
 @property (nonatomic, strong) NSSlider *alphaSlider;
 @property (nonatomic, strong) NSTextField *alphaValueLabel;
 @property (nonatomic, strong) NSSlider *blurRadiusSlider;
@@ -287,20 +289,17 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
                                             font:[NSFont systemFontOfSize:11 weight:NSFontWeightRegular]
                                            color:[NSColor colorWithCalibratedWhite:0.62 alpha:1.0]]];
     
-    NSButton *cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(326, 28, 88, 34)];
-    cancelButton.title = @"关闭主题";
-    cancelButton.bezelStyle = NSBezelStyleRounded;
-    cancelButton.target = self;
-    cancelButton.action = @selector(cancelMistySettings:);
-    [contentView addSubview:cancelButton];
+    self.themeStatusLabel = [self ym_labelWithFrame:NSMakeRect(32, 35, 270, 20)
+                                               text:@""
+                                               font:[NSFont systemFontOfSize:12]
+                                              color:[NSColor colorWithCalibratedWhite:0.72 alpha:1.0]];
+    [contentView addSubview:self.themeStatusLabel];
 
-    NSButton *confirmButton = [[NSButton alloc] initWithFrame:NSMakeRect(424, 28, 88, 34)];
-    confirmButton.title = @"确定配置";
-    confirmButton.bezelStyle = NSBezelStyleRounded;
-    confirmButton.keyEquivalent = @"\r";
-    confirmButton.target = self;
-    confirmButton.action = @selector(confirmMistySettings:);
-    [contentView addSubview:confirmButton];
+    self.themeToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(424, 28, 88, 34)];
+    self.themeToggleButton.bezelStyle = NSBezelStyleRounded;
+    self.themeToggleButton.target = self;
+    self.themeToggleButton.action = @selector(toggleMistyMode:);
+    [contentView addSubview:self.themeToggleButton];
 
     [self ym_applyAdaptiveAppearance];
 }
@@ -519,14 +518,22 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
     self.colorfulAnimationDurationSlider.doubleValue = [defaults doubleForKey:kThemeMistyColorfulAnimationDuration];
 
     [self updateValueLabels];
+    [self updateThemeStateControls];
     [self ym_applyAdaptiveAppearance];
+}
+
+- (void)updateThemeStateControls
+{
+    BOOL enabled = [[NSUserDefaults standardUserDefaults] boolForKey:kThemeMistyMode];
+    self.themeToggleButton.title = enabled ? @"关闭主题" : @"开启主题";
+    self.themeStatusLabel.stringValue = enabled ? @"主题已开启 · 调整即时生效" : @"主题已关闭 · 调整仅保存配置";
+    if (self.confirmHandler) self.confirmHandler(enabled);
 }
 
 - (void)saveSettings:(BOOL)isOpen
 {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 
-    // 点击确定后即认为用户启用迷离模式，菜单打勾。
     [defaults setBool:isOpen forKey:kThemeMistyMode];
     [defaults setDouble:self.alphaSlider.doubleValue forKey:kThemeMistyQNSAlpha];
     [defaults setBool:(self.enableBlurCheckbox.state == NSControlStateValueOn) forKey:kThemeMistyWindowBlurEnabled];
@@ -543,14 +550,6 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
 {
     Class themeHookClass = NSClassFromString(@"ThemeHook");
 
-    SEL startSelector = @selector(start);
-    if (themeHookClass && [themeHookClass respondsToSelector:startSelector]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [themeHookClass performSelector:startSelector];
-#pragma clang diagnostic pop
-    }
-
     SEL refreshSelector = @selector(refreshAllQNSViews);
     if (themeHookClass && [themeHookClass respondsToSelector:refreshSelector]) {
 #pragma clang diagnostic push
@@ -560,10 +559,11 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
     }
 }
 
-- (void)saveOpenSettingsAndApplyImmediately
+- (void)saveCurrentSettingsAndApplyImmediately
 {
-    [self saveSettings:YES];
+    [self saveSettings:[[NSUserDefaults standardUserDefaults] boolForKey:kThemeMistyMode]];
     [self applyThemeSettingsImmediately];
+    [self updateThemeStateControls];
 }
 
 #pragma mark - Actions
@@ -584,14 +584,14 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
 {
     (void)sender;
     [self updateValueLabels];
-    [self saveOpenSettingsAndApplyImmediately];
+    [self saveCurrentSettingsAndApplyImmediately];
 }
 
 - (void)blurRadiusSliderChanged:(NSSlider *)sender
 {
     (void)sender;
     [self updateValueLabels];
-    [self saveOpenSettingsAndApplyImmediately];
+    [self saveCurrentSettingsAndApplyImmediately];
 }
 
 - (void)colorfulSliderChanged:(NSSlider *)sender
@@ -600,7 +600,7 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
         sender.doubleValue = MAX(kYMColorfulBlurRadiusMinValue, MIN(kYMColorfulBlurRadiusMaxValue, sender.doubleValue));
     }
     [self updateValueLabels];
-    [self saveOpenSettingsAndApplyImmediately];
+    [self saveCurrentSettingsAndApplyImmediately];
 }
 
 - (void)liveThemeControlChanged:(id)sender
@@ -608,7 +608,7 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
     (void)sender;
     [self updateValueLabels];
     [self ym_applyAdaptiveAppearance];
-    [self saveOpenSettingsAndApplyImmediately];
+    [self saveCurrentSettingsAndApplyImmediately];
 }
 
 - (void)themeCheckboxChanged:(NSButton *)sender
@@ -617,29 +617,13 @@ static BOOL YMMistySettingsUseLightAppearanceFromCurrentAppearance(void) {
     [self liveThemeControlChanged:sender];
 }
 
-- (void)cancelMistySettings:(id)sender
+- (void)toggleMistyMode:(id)sender
 {
     (void)sender;
-    [self saveSettings:NO];
+    BOOL enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:kThemeMistyMode];
+    [self saveSettings:enabled];
     [self applyThemeSettingsImmediately];
-    if (self.confirmHandler) {
-        self.confirmHandler(NO);
-    }
-    [self.window close];
-}
-
-- (void)confirmMistySettings:(id)sender
-{
-    (void)sender;
-
-    [self saveSettings:YES];
-    [self applyThemeSettingsImmediately];
-
-    if (self.confirmHandler) {
-        self.confirmHandler(YES);
-    }
-
-    [self.window close];
+    [self updateThemeStateControls];
 }
 
 @end
