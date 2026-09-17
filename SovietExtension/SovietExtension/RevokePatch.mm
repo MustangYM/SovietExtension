@@ -53,7 +53,11 @@ static BOOL YMHasRegisteredDyldCallback = NO;
 // 群员退群监控 Patch 状态
 static BOOL YMHasPatchedGroupExitMonitor = NO;
 static BOOL YMHasPatchedGroupExitNickname = NO;
-static std::recursive_mutex YMGroupExitStateMutex;
+static std::recursive_mutex &YMGroupExitStateMutex() {
+    // constructor 可能早于 C++ 全局动态初始化，首次加锁前必须完成构造。
+    static std::recursive_mutex mutex;
+    return mutex;
+}
 static std::atomic<uint64_t> YMGroupExitGeneration(0);
 static std::atomic<uint64_t> YMGroupExitNicknameGeneration(0);
 
@@ -2044,7 +2048,7 @@ static void YMGroupExitClearNicknameState(void) {
 }
 
 static void YMGroupExitClearRuntimeState(const char *source) {
-    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
     YMGroupExitClearNicknameState();
 
     NSMutableArray<NSDictionary<NSString *, id> *> *queue = YMGroupExitPendingNotices();
@@ -2073,7 +2077,7 @@ static void YMGroupExitClearRuntimeState(const char *source) {
 }
 
 static void YMGroupExitClearRuntimeStateIfDisabled(const char *source) {
-    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
     if (!YMIsGroupExitMonitorEnabled()) YMGroupExitClearRuntimeState(source);
 }
 
@@ -2803,7 +2807,7 @@ static void YMGroupExitFlushPendingNotices(const char *source) {
     }
 
     @autoreleasepool {
-        std::unique_lock<std::recursive_mutex> stateLock(YMGroupExitStateMutex);
+        std::unique_lock<std::recursive_mutex> stateLock(YMGroupExitStateMutex());
         uint64_t generation = YMGroupExitGeneration.load();
         NSArray<NSDictionary<NSString *, id> *> *items = YMGroupExitDrainPendingNotices(20);
         stateLock.unlock();
@@ -3243,7 +3247,7 @@ static void YMGroupExitPreloadMemberDataListForRoom(int64_t manager, NSString *r
           (unsigned long)members.size(),
           (unsigned long)members.capacity());
 
-    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
     if (generation != YMGroupExitNicknameGeneration.load()) return;
     if (result != 0 && begin != 0 && members.size() > 0 && members.size() <= 20000) {
         int64_t vectorView[3] = {
@@ -3288,7 +3292,7 @@ static void YMGroupExitFlushPreloadRooms(const char *source) {
     YMGroupExitAtomicBoolResetGuard preloadGuard(&YMGroupExitPreloadingMemberDataList);
 
     @autoreleasepool {
-        std::unique_lock<std::recursive_mutex> stateLock(YMGroupExitStateMutex);
+        std::unique_lock<std::recursive_mutex> stateLock(YMGroupExitStateMutex());
         uint64_t generation = YMGroupExitNicknameGeneration.load();
         int64_t manager = YMGroupExitKnownChatroomManager.load();
         if (manager == 0 || !YMGroupExitMemberDataListRuntimeAddress) {
@@ -3328,7 +3332,7 @@ static void YMGroupExitFlushPreloadRooms(const char *source) {
 }
 
 static void YMGroupExitCaptureChatroomManagerFromOperatorContext(int64_t context, const char *source) {
-    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+    std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
     if (!YMIsGroupExitNicknameEnabled() || context == 0) {
         return;
     }
@@ -3389,7 +3393,7 @@ static int64_t YMGroupExitMemberDataListHook(int64_t a1, int64_t *roomID, int64_
 
         uint64_t generation = YMGroupExitNicknameGeneration.load();
         int64_t result = YMGroupExitCallOriginalMemberDataList(a1, roomID, outVector);
-        std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+        std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
         if (!YMIsGroupExitNicknameEnabled() || generation != YMGroupExitNicknameGeneration.load()) return result;
         if (a1 != 0) YMGroupExitKnownChatroomManager.store(a1);
 
@@ -3416,7 +3420,7 @@ static int64_t YMGroupExitDBApplyHook(int64_t task) {
 
         int64_t result = YMGroupExitCallOriginalDBApply(task);
 
-        std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex);
+        std::lock_guard<std::recursive_mutex> lock(YMGroupExitStateMutex());
         if (YMIsGroupExitMonitorEnabled() && generation == YMGroupExitGeneration.load()) {
             YMGroupExitHandleDBApplySnapshots(snapshots, result);
         } else {
@@ -5360,7 +5364,7 @@ YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL enabled) {
         if (enabled && (!profile || !YMGroupExitProfileReady(profile))) return YMFeatureUnavailable;
         if (enabled && ((monitorKey && (!YMHasPatchedGroupExitMonitor || (nickname && !YMHasPatchedGroupExitNickname))) ||
                         (nicknameKey && !YMHasPatchedGroupExitNickname))) return YMFeatureNeedsRestart;
-        std::lock_guard<std::recursive_mutex> stateLock(YMGroupExitStateMutex);
+        std::lock_guard<std::recursive_mutex> stateLock(YMGroupExitStateMutex());
         BOOL monitorChanged = monitor != YMFeatureGroupExitMonitorEnabled.load();
         BOOL nicknameChanged = nickname != YMFeatureGroupExitNicknameEnabled.load();
         YMFeatureGroupExitMonitorEnabled.store(monitor);
