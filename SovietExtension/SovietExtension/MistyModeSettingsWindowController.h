@@ -22,6 +22,14 @@ static NSString *kThemeMistyColorfulOpacity = @"kThemeMistyColorfulOpacity.SOVIE
 static NSString *kThemeMistyColorfulBlurRadius = @"kThemeMistyColorfulBlurRadius.SOVIET";
 static NSString *kThemeMistyColorfulAnimationDuration = @"kThemeMistyColorfulAnimationDuration.SOVIET";
 
+static NSString *kThemeAppearanceMode = @"kThemeAppearanceMode.SOVIET";
+static NSString *kThemeAppearanceMisty = @"misty";
+static NSString *kThemeAppearancePink = @"pink";
+static NSString *kThemeAppearanceImage = @"image";
+static NSString *kThemeBackgroundImagePath = @"kThemeBackgroundImagePath.SOVIET";
+static NSString *kThemeBackgroundImageSourceURL = @"kThemeBackgroundImageSourceURL.SOVIET";
+static NSString *kThemeBackgroundImageOpacity = @"kThemeBackgroundImageOpacity.SOVIET";
+
 /// 迷离模式设置窗口。
 /// MenuManager 只负责打开这个窗口，具体 UI、读写配置、立即应用效果都在这里处理。
 @interface MistyModeSettingsWindowController : NSWindowController

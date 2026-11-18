@@ -5,6 +5,8 @@
 //
 
 #import "ThemeHook.h"
+#import "ModernThemeHook.h"
+#import "WeChatCompatibility.h"
 #import "StartupPermission.h"
 
 #import <AppKit/AppKit.h>
@@ -162,6 +164,7 @@ static BOOL YMIsAppearanceDark(NSAppearance *appearance) {
 }
 
 BOOL YMCarrierStyleIsDark(void) {
+    if (YMMatchesWeChat270353Dylib()) return YMModernCarrierStyleIsDark();
     // 自动跟随当前微信 / AppKit 的有效外观，不再依赖手动“深色 / 浅色”配置。
     if (![NSThread isMainThread]) {
         __block BOOL dark = YES;
@@ -195,6 +198,7 @@ static CGFloat YMWindowBlurCarrierAlpha(void) {
 #pragma mark - Colorful 风格动态渐变背景
 
 BOOL YMColorfulBlurBackgroundEnabled(void) {
+    if (YMMatchesWeChat270353Dylib()) return YMModernColorfulBlurBackgroundEnabled();
     if (!YMMistyModeEnabled()) return NO;
     if (!YMBoolSetting(kThemeMistyColorful, NO)) return NO;
     if (!YMWindowBackgroundBlurEnabled()) return NO;
@@ -203,16 +207,19 @@ BOOL YMColorfulBlurBackgroundEnabled(void) {
 }
 
 CGFloat YMColorfulBlurBackgroundOpacity(void) {
+    if (YMMatchesWeChat270353Dylib()) return YMModernColorfulBlurBackgroundOpacity();
     CGFloat opacity = YMFloatSetting(kThemeMistyColorfulOpacity, kYMDefaultColorfulOpacity);
     return MAX(0.0f, MIN(1.0f, opacity));
 }
 
 CGFloat YMColorfulBlurInternalBlurRadius(void) {
+    if (YMMatchesWeChat270353Dylib()) return YMModernColorfulBlurInternalBlurRadius();
     CGFloat radius = YMFloatSetting(kThemeMistyColorfulBlurRadius, kYMDefaultColorfulInternalBlurRadius);
     return MAX(kYMMinColorfulInternalBlurRadius, MIN(kYMMaxColorfulInternalBlurRadius, radius));
 }
 
 NSTimeInterval YMColorfulAnimationDuration(void) {
+    if (YMMatchesWeChat270353Dylib()) return YMModernColorfulAnimationDuration();
     CGFloat duration = YMFloatSetting(kThemeMistyColorfulAnimationDuration, kYMDefaultColorfulAnimationDuration);
     return MAX(2.0f, MIN(60.0f, duration));
 }
@@ -861,6 +868,11 @@ static void YMInstallQNSViewHooks(void) {
 @implementation ThemeHook
 
 + (void)start {
+    if (YMMatchesWeChat270353Dylib()) {
+        [ModernThemeHook start];
+        return;
+    }
+    if ([[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] isEqual:@"270353"]) return;
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self start]; });
         return;
@@ -902,6 +914,7 @@ static void YMInstallQNSViewHooks(void) {
 
 __attribute__((constructor))
 static void YMWeChatAntiRevokePatchEntry(void) {
+    if ([[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] isEqual:@"270353"]) return;
     SOVEXTCheckStartupPermission();
     @autoreleasepool {
         dispatch_async(dispatch_get_main_queue(), ^{

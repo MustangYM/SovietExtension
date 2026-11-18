@@ -8,6 +8,10 @@
 		<data>
 		tRrW2usRgI9UesCP4aVWTPAqtSk=
 		</data>
+		<key>Resources/ThemeConfig.plist</key>
+		<data>
+		DQQjK8fq7DgV1IUyCrHAgF5/Gow=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -16,6 +20,13 @@
 			<key>hash2</key>
 			<data>
 			Nnt8nOE0tH8R2HFSob5ScgV5AGrxacnSRbE2KrOnR8w=
+			</data>
+		</dict>
+		<key>Resources/ThemeConfig.plist</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			bm7dq3roL+h6oDrW6gEqqpaIykWQ8Q5L+Oq2RH6Vnys=
 			</data>
 		</dict>
 	</dict>

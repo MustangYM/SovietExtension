@@ -574,18 +574,21 @@ backup_executable() {
     fi
 
     if is_executable_injected "${APP_EXECUTABLE_PATH}"; then
-        # Older Xcode installs used this name. Reuse only a clean copy of this binary.
-        local legacy_backup="${APP_EXECUTABLE_PATH}_backup"
-        local current_uuids="" legacy_uuids=""
-        if [ -f "${legacy_backup}" ] && ! is_executable_injected "${legacy_backup}"; then
-            current_uuids="$(otool -l "${APP_EXECUTABLE_PATH}" | awk '$1 == "uuid" {print $2}' | sort)" || current_uuids=""
+        # Older installers named the backup using the short version or Xcode suffix.
+        local legacy_backup="" current_uuids="" legacy_uuids=""
+        current_uuids="$(otool -l "${APP_EXECUTABLE_PATH}" | awk '$1 == "uuid" {print $2}' | sort)" || current_uuids=""
+        for legacy_backup in "${APP_EXECUTABLE_PATH}.backup.${APP_SHORT_VERSION}.${APP_BUILD_VERSION}" \
+                             "${APP_EXECUTABLE_PATH}_backup"; do
+            if [ ! -f "${legacy_backup}" ] || is_executable_injected "${legacy_backup}"; then
+                continue
+            fi
             legacy_uuids="$(otool -l "${legacy_backup}" | awk '$1 == "uuid" {print $2}' | sort)" || legacy_uuids=""
             if [ -n "${current_uuids}" ] && [ "${current_uuids}" = "${legacy_uuids}" ]; then
                 run_cmd cp -p "${legacy_backup}" "${BACKUP_PATH}"
-                ok "Migrated clean Xcode backup / 已迁移匹配当前程序的干净 Xcode 备份"
+                ok "Migrated clean backup / 已迁移匹配当前程序的干净备份"
                 return 0
             fi
-        fi
+        done
         die "WeChat executable is already injected, but clean backup is missing / 当前微信主程序已被注入，但没有干净备份。请先重新安装微信或恢复原版"
     fi
 

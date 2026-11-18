@@ -68,11 +68,19 @@
 | 4.1.11.23 |  269079 |         ✅ 支持         | ❌ 不支持 | [Github 归档](https://github.com/zsbai/wechat-versions/releases/tag/4.1.11.23)           | [1.1.2](https://github.com/MustangYM/SovietExtension/releases/tag/1.1.2) 已测试 |
 | 4.1.10.53 |  268853 |         ✅ 支持         | ❌ 不支持 | [微信官网](https://weixin.qq.com/updates?platform=mac&version=4.1.10)           | 截止 2026-06-19，我在官网下载到的版本 |
 
+| 4.2.0.17 | 270353 | ✅ 外观功能 | ❌ 不支持 | [微信官网](https://mac.weixin.qq.com/) | 源码构建，待实机验收 |
+
 > 不在表格中的版本暂不保证可用。
 > 即使大版本看起来一样，只要 Build 号不同，也可能无法使用。
 
 [wechat-versions历史版本下载](https://github.com/zsbai/wechat-versions/releases)
 ---
+
+## 微信 4.2.0.17 外观功能
+
+从 Apple Silicon 微信 4.2.0.17（Build 270353）开始，苏维埃助手菜单新增会话着色、逐条消息时间、群身份标识、头像圆角，主题模式中提供新版皮肤设置（迷离、粉色和自定义图片）。群身份标识显示群主与管理员。
+
+上述五项加在原有助手菜单上。原有功能继续按各自的宿主版本及接口检查启用，现有 4.1.x 原生适配仍适用于原支持版本。测试这版源码时，请使用本次构建生成的 framework；已有的发布包不包含这次适配。
 
 ## Install / 安装
 

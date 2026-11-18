@@ -28,3 +28,4 @@
 
 4.1.10.53|4.1.10|268853|Tested on Mac WeChat 4.1.10.53
 4.1.11.23|4.1.11|269079|Tested on Mac WeChat 4.1.11.23
+4.2.0.17|4.2.0|270353|Apple Silicon appearance features

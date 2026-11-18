@@ -5,7 +5,17 @@
 //  Created by MustangYM on 2026/6/13.
 //
 
+#import "WeChatCompatibility.h"
+#import "SkinSettingsWindowController.h"
+#import "MessageTimestamp.h"
+#import "GroupRoleBadgeSettingsWindowController.h"
+#import "SessionMarkSettingsWindowController.h"
+#import "RoundedAvatarSettingsWindowController.h"
+#import "AssistantUI.h"
+#import "ThemeHook.h"
+#import "SessionMarkOverlay.h"
 #import "MenuManager.h"
+#include <math.h>
 #import "NSMenuItem+Action.h"
 #import "NSMenu+Action.h"
 #import "RevokePatch.h"
@@ -49,6 +59,9 @@ static void YMProtectAssistantMenuRole(void) {
 
 @interface MenuManager ()
 @property (nonatomic, strong) NSMenuItem *ym_mistyModeMenuItem;
+@property (nonatomic, strong) RoundedAvatarSettingsWindowController *ym_roundedAvatarSettingsWindowController;
+@property (nonatomic, strong) GroupRoleBadgeSettingsWindowController *ym_groupRoleBadgeSettingsWindowController;
+@property (nonatomic, strong) SessionMarkSettingsWindowController *ym_sessionMarkSettingsWindowController;
 @property (nonatomic, strong) MistyModeSettingsWindowController *ym_mistySettingsWindowController;
 @property (nonatomic, strong) SidebarSettingsWindowController *ym_sidebarSettingsWindowController;
 @end
@@ -163,10 +176,21 @@ static void YMProtectAssistantMenuRole(void) {
         groupMenu,
         autoLoginMenu,
         useSystemWebMenu,
-        newWeChatMenu,
-        currentVersionMenu
+        newWeChatMenu
     ]];
-    
+    if (YMMatchesWeChat270353Dylib()) {
+        NSArray<NSString *> *titles = @[@"会话着色…", @"逐条消息时间…", @"群身份标识…", @"头像圆角…"];
+        SEL actions[] = {@selector(onSessionMarkSettings:), @selector(onMessageTimestampSettings:),
+                         @selector(onGroupRoleBadgeSettings:), @selector(onRoundedAvatarSettings:)};
+        for (NSUInteger index = 0; index < titles.count; index++) {
+            NSMenuItem *appearance = [[NSMenuItem alloc] initWithTitle:titles[index]
+                action:actions[index] keyEquivalent:@""];
+            appearance.target = self;
+            [subMenu addItem:appearance];
+        }
+    }
+    [subMenu addItem:currentVersionMenu];
+
     NSMenuItem *menuItem = [[NSMenuItem alloc] init];
     menuItem.title = @"苏维埃助手";
     menuItem.target = self;
@@ -266,6 +290,68 @@ static void YMProtectAssistantMenuRole(void) {
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
 }
 
+- (void)onRoundedAvatarSettings:(id)sender {
+    (void)sender;
+    if (!self.ym_roundedAvatarSettingsWindowController)
+        self.ym_roundedAvatarSettingsWindowController = [[RoundedAvatarSettingsWindowController alloc] init];
+    [self.ym_roundedAvatarSettingsWindowController showWindowCentered];
+}
+
+- (void)onGroupRoleBadgeSettings:(id)sender {
+    (void)sender;
+    if (!YMMessageTimestampAvailable()) return;
+    if (!self.ym_groupRoleBadgeSettingsWindowController)
+        self.ym_groupRoleBadgeSettingsWindowController = [[GroupRoleBadgeSettingsWindowController alloc] init];
+    [self.ym_groupRoleBadgeSettingsWindowController showWindowCentered];
+}
+
+- (void)onSessionMarkSettings:(id)sender {
+    (void)sender;
+    if (!YMSessionMarkAvailable()) return;
+    if (!self.ym_sessionMarkSettingsWindowController)
+        self.ym_sessionMarkSettingsWindowController = [[SessionMarkSettingsWindowController alloc] init];
+    [self.ym_sessionMarkSettingsWindowController showWindowCentered];
+}
+
+- (void)onMessageTimestampSettings:(NSMenuItem *)item
+{
+    if (!YMMessageTimestampAvailable()) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"逐条消息时间";
+    alert.informativeText = @"时间显示在消息头像下方；短消息空间不足时自动排成一行。";
+    [alert addButtonWithTitle:@"保存设置"];
+    [alert addButtonWithTitle:@"取消"];
+
+    alert.icon = [NSImage imageWithSystemSymbolName:@"clock" accessibilityDescription:@"消息时间"];
+    YMUITimestampEditor *view = [[YMUITimestampEditor alloc] initWithFrame:NSMakeRect(0,0,460,260)];
+    NSButton *enabled=view.enabled;
+    NSPopUpButton *format=view.format;
+    NSColorWell *colorWell=view.colorWell;
+    enabled.state=[defaults boolForKey:YMMessageTimestampEnabledKey]?NSControlStateValueOn:NSControlStateValueOff;
+    [format selectItemAtIndex:MAX(0,MIN(2,[defaults integerForKey:YMMessageTimestampFormatKey]))];
+    NSString *hex=[defaults stringForKey:YMMessageTimestampColorKey]?:@"#8F98A8";
+    unsigned rgb=0x8F98A8;
+    if(hex.length==7 && [hex hasPrefix:@"#"])[[NSScanner scannerWithString:[hex substringFromIndex:1]] scanHexInt:&rgb];
+    colorWell.color=[NSColor colorWithSRGBRed:((rgb>>16)&255)/255.0 green:((rgb>>8)&255)/255.0 blue:(rgb&255)/255.0 alpha:1];
+    [view refreshPreview:nil];
+    alert.accessoryView=view;
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    [defaults setBool:enabled.state == NSControlStateValueOn forKey:YMMessageTimestampEnabledKey];
+    [defaults setInteger:format.indexOfSelectedItem forKey:YMMessageTimestampFormatKey];
+    NSColor *color = [colorWell.color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+    if (color) {
+        NSString *saved = [NSString stringWithFormat:@"#%02X%02X%02X",
+            (unsigned)lrint(color.redComponent * 255),
+            (unsigned)lrint(color.greenComponent * 255),
+            (unsigned)lrint(color.blueComponent * 255)];
+        [defaults setObject:saved forKey:YMMessageTimestampColorKey];
+    }
+    [defaults synchronize];
+    [ThemeHook refreshAllQNSViews];
+}
+
 - (void)onMistyMode:(NSMenuItem *)item
 {
     self.ym_mistyModeMenuItem = item;
@@ -310,7 +396,7 @@ static void YMProtectAssistantMenuRole(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     BOOL mistyEnabled = [defaults boolForKey:kThemeMistyMode];
     
-    NSMenuItem *mistyModeMenu = [NSMenuItem menuItemWithTitle:@"迷离模式  ▶"
+    NSMenuItem *mistyModeMenu = [NSMenuItem menuItemWithTitle:(YMMatchesWeChat270353Dylib() ? @"皮肤设置…" : @"迷离模式  ▶")
                                                        action:@selector(onMistyMode:)
                                                        target:self
                                                 keyEquivalent:@""
@@ -332,7 +418,9 @@ static void YMProtectAssistantMenuRole(void) {
 - (void)ym_showMistyModeSettingsWindow:(NSMenuItem *)item
 {
     if (!self.ym_mistySettingsWindowController) {
-        self.ym_mistySettingsWindowController = [[MistyModeSettingsWindowController alloc] init];
+        self.ym_mistySettingsWindowController = YMMatchesWeChat270353Dylib()
+            ? [[SkinSettingsWindowController alloc] init]
+            : [[MistyModeSettingsWindowController alloc] init];
         __weak typeof(self) weakSelf = self;
         self.ym_mistySettingsWindowController.confirmHandler = ^(BOOL isOpen) {
             __strong typeof(weakSelf) strongSelf = weakSelf;

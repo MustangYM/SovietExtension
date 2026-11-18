@@ -8,6 +8,10 @@
 //         -- MustangYM 2026-6-16
 
 #import "RevokePatch.h"
+#import "WeChatCompatibility.h"
+#import "MessageTimestamp.h"
+#import "SessionMarkOverlay.h"
+#import "ThemeHook.h"
 #import "StartupPermission.h"
 #import "AntiUpdate.h"
 #import "AutoLogin.h"
@@ -5295,6 +5299,12 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
           (unsigned long)vmaddr_slide);
 
     YMRecordWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
+    YMInitializeWeChatCompatibility(mh);
+    if (YMMatchesWeChat270353Dylib()) {
+        YMInstallMessageTimestamp();
+        YMInstallSessionMark();
+        dispatch_async(dispatch_get_main_queue(), ^{ [ThemeHook start]; });
+    }
     YMInstallMessageMenuPatch();
 
     /*
