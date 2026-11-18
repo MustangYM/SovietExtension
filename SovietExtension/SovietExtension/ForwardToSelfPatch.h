@@ -52,6 +52,7 @@ uintptr_t YMMessageDataConstructorRuntimeAddress(void);
 NSString *YMQueryRoomName(NSString *roomID);
 
 BOOL YMRevokeRealSendForwardEnabled(void);
+BOOL YMForwardVoiceToSelf(uintptr_t wrap, NSString *sourceSession, NSString *selfID);
 
 /// 撤回消息 → 本人文字通知；269079 对类型 3/43/47/49 同时提交原内容转发。
 /// 通知保留撤回人、内容和时间；文字原文包含在通知中，不再额外发送一条原文。

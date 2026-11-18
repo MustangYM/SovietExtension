@@ -193,18 +193,18 @@ static void YMGroupExitPumpNotices(void) {
                 } catch (...) { YMLog(@"[GroupExitMonitor] notice task cancelled"); } }
                 if (!finished->exchange(true)) busy.store(false);
             };
-            void *app = ((void *(*)())YMRuntimeAddress(0x428D0BC))();
-            auto scheduler = app ? ((YMGroupExitGetter)YMRuntimeAddress(0x428E6A0))(app) : YMGroupExitShared{};
+            void *app = ((void *(*)())YMGroupExitNativeAddress(0x428D0BC))();
+            auto scheduler = app ? ((YMGroupExitGetter)YMGroupExitNativeAddress(0x428E6A0))(app) : YMGroupExitShared{};
             auto task = scheduler ? ((YMGroupExitShared (*)(void *, const GX::SourceLocation *, std::function<void()> *, int))
-                YMRuntimeAddress(0x3A280F0))(scheduler.get(), &YMGroupExitLocation, &work, 1) : YMGroupExitShared{};
-            if (!task || *(uintptr_t *)task.get() != YMRuntimeAddress(0x8EB9550) ||
-                ((bool (*)(void *))YMRuntimeAddress(0x597C66C))(task.get())) {
+                YMGroupExitNativeAddress(0x3A280F0))(scheduler.get(), &YMGroupExitLocation, &work, 1) : YMGroupExitShared{};
+            if (!task || *(uintptr_t *)task.get() != YMGroupExitNativeAddress(0x8EB9550) ||
+                ((bool (*)(void *))YMGroupExitNativeAddress(0x597C66C))(task.get())) {
                 finished->store(true); busy.store(false); return;
             }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
                 if (finished->exchange(true)) return;
                 busy.store(false);
-                try { ((void (*)(void *))YMRuntimeAddress(0x597BE88))(task.get()); } catch (...) {}
+                try { ((void (*)(void *))YMGroupExitNativeAddress(0x597BE88))(task.get()); } catch (...) {}
             });
         } catch (...) { busy.store(false); }
     } catch (...) { YMLog(@"[GroupExitMonitor] notice scheduling failed; will retry"); } }
@@ -333,7 +333,7 @@ __asm__(
 static BOOL YMGroupExitWriteCodeBytes(uintptr_t, const uint8_t *, size_t, const char *, const char *);
 // The task vtable is DYLD_CHAINED_PTR_64_OFFSET (not authenticated). Keep its protection.
 static bool YMGroupExitWriteDBSlot(uintptr_t value) {
-    vm_address_t address = YMRuntimeAddress(0x8CEF178), region = address;
+    vm_address_t address = YMGroupExitNativeAddress(0x8CEF178), region = address;
     vm_size_t size = 0;
     vm_region_basic_info_data_64_t info{};
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
@@ -353,22 +353,22 @@ static BOOL YMGroupExitInstallCapture(void) {
     static const uint8_t entry[16] = {0xfc,0x6f,0xba,0xa9,0xfa,0x67,0x01,0xa9,0xf8,0x5f,0x02,0xa9,0xf6,0x57,0x03,0xa9};
     static const uint8_t result[16] = {0x13,0x00,0x40,0x39,0xf7,0x57,0x41,0xf9,0xb7,0x00,0x00,0xb4,0xe8,0x22,0x00,0x91};
     uint8_t bytes[16]; uintptr_t slot = 0;
-    if (!YMSafeReadMemory(YMRuntimeAddress(0x213AB2C), bytes, 16) || memcmp(bytes, entry, 16) ||
-        !YMSafeReadMemory(YMRuntimeAddress(0x213C83C), bytes, 16) || memcmp(bytes, result, 16) ||
-        !YMSafeReadMemory(YMRuntimeAddress(0x2291064), bytes, 16) || memcmp(bytes, entry, 16) ||
-        !YMSafeReadPointer(YMRuntimeAddress(0x8CEF178), &slot) || slot != YMRuntimeAddress(0x2291064)) return NO;
-    YMExitEntryAfter = YMRuntimeAddress(0x213AB3C);
-    YMExitResultAfter = YMRuntimeAddress(0x213C84C);
-    YMExitResultZero = YMRuntimeAddress(0x213C858);
+    if (!YMSafeReadMemory(YMGroupExitNativeAddress(0x213AB2C), bytes, 16) || memcmp(bytes, entry, 16) ||
+        !YMSafeReadMemory(YMGroupExitNativeAddress(0x213C83C), bytes, 16) || memcmp(bytes, result, 16) ||
+        !YMSafeReadMemory(YMGroupExitNativeAddress(0x2291064), bytes, 16) || memcmp(bytes, entry, 16) ||
+        !YMSafeReadPointer(YMGroupExitNativeAddress(0x8CEF178), &slot) || slot != YMGroupExitNativeAddress(0x2291064)) return NO;
+    YMExitEntryAfter = YMGroupExitNativeAddress(0x213AB3C);
+    YMExitResultAfter = YMGroupExitNativeAddress(0x213C84C);
+    YMExitResultZero = YMGroupExitNativeAddress(0x213C858);
     YMGroupExitOriginalMemberDB = (YMGroupExitMemberDB)slot;
     bool installed = YMGroupExitWriteDBSlot((uintptr_t)&YMGroupExitConfirmMemberDB) &&
-        YMPatchARM64AbsoluteJump(YMRuntimeAddress(0x213C83C), (uintptr_t)&YMExitResultBridge, "member response result") &&
-        YMPatchARM64AbsoluteJump(YMRuntimeAddress(0x213AB2C), (uintptr_t)&YMExitEntryBridge, "member response capture");
+        YMPatchARM64AbsoluteJump(YMGroupExitNativeAddress(0x213C83C), (uintptr_t)&YMExitResultBridge, "member response result") &&
+        YMPatchARM64AbsoluteJump(YMGroupExitNativeAddress(0x213AB2C), (uintptr_t)&YMExitEntryBridge, "member response capture");
     if (!installed) {
         YMGroupExitCaptureReady.store(false);
         // All bridges retain valid continuations even if protection restoration fails.
-        bool restoredEntry = YMGroupExitWriteCodeBytes(YMRuntimeAddress(0x213AB2C), entry, 16, "member response", "rollback");
-        bool restoredResult = YMGroupExitWriteCodeBytes(YMRuntimeAddress(0x213C83C), result, 16, "member response result", "rollback");
+        bool restoredEntry = YMGroupExitWriteCodeBytes(YMGroupExitNativeAddress(0x213AB2C), entry, 16, "member response", "rollback");
+        bool restoredResult = YMGroupExitWriteCodeBytes(YMGroupExitNativeAddress(0x213C83C), result, 16, "member response result", "rollback");
         bool restoredSlot = YMGroupExitWriteDBSlot(slot);
         YMLog(@"[GroupExitMonitor] capture installation failed; rollback=%@; monitoring unavailable",
               restoredEntry && restoredResult && restoredSlot ? @"OK" : @"FAILED");

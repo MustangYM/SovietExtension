@@ -92,7 +92,7 @@ static void YMProtectAssistantMenuRole(void) {
                                                               key:kAntiUpdate
                                                            action:@selector(onAntiUpdate:)];
     
-    BOOL separateRevoke = [[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"];
+    BOOL separateRevoke = YMBuildUsesSeparateRevokeSettings([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]);
     NSMenu *revokeGroupSub = [[NSMenu alloc] initWithTitle:@"消息撤回"];
     [revokeGroupSub addItem:[self ym_toggleMenuItemWithTitle:@"消息防撤回"
         key:separateRevoke ? kRevokeEnabled : kAntiRevoke action:@selector(onRevokeEnabled:)]];
@@ -223,7 +223,7 @@ static void YMProtectAssistantMenuRole(void) {
 
 - (void)onRevokeEnabled:(NSMenuItem *)item
 {
-    if (![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
+    if (!YMBuildUsesSeparateRevokeSettings([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"])) {
         [self onAntiRevoke:item];
         return;
     }
@@ -499,7 +499,7 @@ static void YMProtectAssistantMenuRole(void) {
     
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setBool:enabled forKey:key];
-    if ([[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqualToString:@"269079"]) {
+    if (YMBuildUsesSeparateRevokeSettings([NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"])) {
         for (NSArray<NSString *> *group in @[@[kRevokeEnabled, kAntiRevoke, kSelfAntiRevoke],
                                             @[kRevokeForwardToSelfRealSend, kRevokeForwardOthers, kRevokeForwardSelf]]) {
             if (![group containsObject:key]) continue;

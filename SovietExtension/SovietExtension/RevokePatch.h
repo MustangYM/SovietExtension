@@ -33,4 +33,26 @@ FOUNDATION_EXPORT YMFeatureApplyResult YMApplyFeatureSetting(NSString *key, BOOL
 NSString *YMResolveMemberDisplayName(NSString * _Nullable memberID, NSString * _Nullable roomID,
                                      NSString * _Nullable sourceName, NSString * _Nullable capturedGroupName);
 
+struct YMVoiceForwardAddresses {
+    uintptr_t account;
+    uintptr_t accountLauncher;
+    uintptr_t service;
+    uintptr_t context;
+    uintptr_t manager;
+    uintptr_t launch;
+    uintptr_t query;
+    uintptr_t await;
+    uintptr_t result;
+    uintptr_t makeVoice;
+    uintptr_t subscribe;
+    uintptr_t destroyLazy;
+    uintptr_t dynamicCast;
+    uintptr_t messageExtRTTI;
+    uintptr_t voiceExtRTTI;
+};
+
+BOOL YMGetVoiceForwardAddresses(struct YMVoiceForwardAddresses *out);
+
+BOOL YMMatchesWeChatLegacyNativeDylib(void);
+
 NS_ASSUME_NONNULL_END

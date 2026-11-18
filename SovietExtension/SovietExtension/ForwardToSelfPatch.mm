@@ -22,7 +22,7 @@
 //     - “CGI”是历史命名，269079 的该入口内部也会构造并订阅原生文字发送任务。
 //       269079 地址保留为逆向适配参考，不写入当前 profile。
 //
-//  ★ 旧文字请求对象布局（不等同于下方的 0x340 字节 MessageData）：
+//  ★ 旧文字请求对象布局（不等同于下方的 0x350 字节 MessageData）：
 //     +0x000: uint32_t type = 5
 //     +0x120: std::string to       （接收方 wxid）
 //     +0x138: std::string content  （消息正文）
@@ -68,6 +68,9 @@
 //
 
 #import "ForwardToSelfPatch.h"
+#import "WeChatCompatibility.h"
+#import "ForwardNoticeNavigation.h"
+#include <mach/mach_vm.h>
 #import "SelfRevokePatch.h"
 #import "QuotedReply.h"
 #import <objc/message.h>
@@ -314,7 +317,7 @@ static BOOL YMForwardViaSendMsgCGI(uintptr_t fn, NSString *selfId, NSString *con
 
 struct YMForwardMessageData {
     // 仅提供对齐存储。内部含 string/shared_ptr/容器，必须通过原生构造、转换和析构管理。
-    uintptr_t words[0x340 / sizeof(uintptr_t)];
+    uintptr_t words[0x350 / sizeof(uintptr_t)];
 };
 
 struct YMForwardTargets {
@@ -372,7 +375,7 @@ static BOOL YMSubmitMessageToSession(const YMForwardMessageData *message,
 }
 
 // selfId 必须先通过 YMForwardLooksLikeSafeSelfID；只为新通知构造对象，不修改原消息快照。
-static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
+static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content, NSDictionary *target) {
     if (!YMForwardLooksLikeSafeSelfID(selfId) || !content.length) return NO;
     YMMediaForwardAddresses addresses = {};
     if (!YMGetMediaForwardAddresses(&addresses)) return NO;
@@ -386,7 +389,7 @@ static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
         NSString *recipient = [selfId copy];
         NSString *notice = [content copy];
         dispatch_async(dispatch_get_main_queue(), ^{
-            YMForwardNoticeToSelf(recipient, notice);
+            YMForwardNoticeToSelf(recipient, notice, target);
         });
         return YES;
     }
@@ -410,7 +413,8 @@ static BOOL YMForwardNoticeToSelf(NSString *selfId, NSString *content) {
         *(std::string *)(data + 0x28) = recipientUTF8;
         *(std::string *)(data + 0x40) = recipientUTF8;
         *(std::string *)(data + 0x58) = recipientUTF8;
-        ((std::string *)(data + 0xb0))->assign(contentUTF8, [content lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+        ((std::string *)(data + (YMMatchesWeChat270353Dylib() ? 0xb8 : 0xb0)))->assign(contentUTF8, [content lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+        YMForwardNoticeScope scope(target);
         return YMSubmitMessageToSession(message.get(), selfId, addresses);
     } catch (...) {
         YMForwardLog(@"native notice construction failed");
@@ -505,6 +509,28 @@ BOOL YMForwardMessageToSession(uintptr_t outWrap,
     return YMForwardNativeToSession(outWrap, originType, sessionID);
 }
 
+static NSDictionary *YMForwardOriginalMessageTarget(uintptr_t outWrap, uint32_t originType,
+                                              NSString *session, NSString *account) {
+    YMMediaForwardAddresses addresses{};
+    if (!outWrap || outWrap > UINTPTR_MAX - 0x118 || !YMIsForwardSessionValid(session) ||
+        !YMGetMediaForwardAddresses(&addresses)) return nil;
+
+    // 只读取已通过 269079 版本、UUID 和入口指纹门禁的原 Wrap；不借用通知自身的身份。
+    uint8_t identity[0x118]{};
+    mach_vm_size_t copied = 0;
+    if (mach_vm_read_overwrite(mach_task_self(), outWrap, sizeof identity,
+                              (mach_vm_address_t)identity, &copied) != KERN_SUCCESS ||
+        copied != sizeof identity) return nil;
+    uint32_t type = 0;
+    uint64_t serverID = 0;
+    memcpy(&type, identity + 0xc, sizeof type);
+    memcpy(&serverID, identity + 0xf8, sizeof serverID);
+    if (type != originType || !serverID || ![YMSelfRevokeSession(outWrap) isEqualToString:session]) return nil;
+    if (![account isEqual:YMSelfRevokeAccount()]) return nil;
+    return @{@"account": account, @"session": session,
+        @"serverID": [NSString stringWithFormat:@"%llu", (unsigned long long)serverID]};
+}
+
 BOOL YMForwardToSelfSend(uintptr_t outWrap,
                          uint32_t originType,
                          NSString *originContent,
@@ -537,6 +563,9 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
     YMQuotedReplyText(originContent, originType, &quotedReply);
     BOOL mediaSubmitted = !legacySend && !quotedReply && (originType == 3 || originType == 43 || originType == 47 || originType == 49) &&
                           YMForwardNativeToSession(outWrap, originType, selfId, YES);
+    if (!legacySend && originType == 34) {
+        mediaSubmitted = YMForwardVoiceToSelf(outWrap, sessionText, selfId);
+    }
     NSString *notice = YMBuildRevokeForwardNotice(sessionText ?: @"",
                                                   originType,
                                                   originContent ?: @"",
@@ -559,7 +588,7 @@ BOOL YMForwardToSelfSend(uintptr_t outWrap,
                  (unsigned long)notice.length);
 
     BOOL noticeSent = legacySend ? YMForwardViaSendMsgCGI(legacySend, selfId, notice)
-                                 : YMForwardNoticeToSelf(selfId, notice);
+                                 : YMForwardNoticeToSelf(selfId, notice, YMForwardOriginalMessageTarget(outWrap, originType, sessionText, selfId));
     // 返回值仅表示通知或媒体已排队；异步失败记录日志，不代表送达。
     return mediaSubmitted || noticeSent;
 }

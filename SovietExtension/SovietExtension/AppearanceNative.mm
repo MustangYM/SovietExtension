@@ -1,6 +1,7 @@
 #import "AppearanceNative.h"
 #import "WeChatCompatibility.h"
 #import "RevokePatch.h"
+#import "ForwardToSelfPatch.h"
 #include "GroupRoleNative.h"
 #include <functional>
 #include <limits>
@@ -92,7 +93,8 @@ NSString *YMAppearanceAccount(void) {
 }
 
 NSString *YMAppearanceSessionName(NSString *session) {
-    return YMResolveMemberDisplayName(session, nil, nil, nil);
+    NSString *room = YMQueryRoomName(session);
+    return room.length ? room : YMResolveMemberDisplayName(session, nil, nil, nil);
 }
 BOOL YMAppearanceValidSession(NSString *value) {
     return value.length && value.length <= 128 &&
